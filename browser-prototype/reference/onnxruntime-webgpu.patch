@@ -1,5 +1,5 @@
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..f099bd4 100644
+index 45baa67..8e9b04a 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -112,6 +112,35 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -38,7 +38,7 @@ index 45baa67..f099bd4 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,6 +251,52 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,6 +251,55 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -52,7 +52,10 @@ index 45baa67..f099bd4 100644
 +  constexpr uint32_t kMaxBatchedM = 16;
 +  if ((nbits == 4 || nbits == 8) && M >= kMinBatchedM && M <= kMaxBatchedM && dispatch_M == M &&
 +      !has_weight_idx && !single_scale_weights && components_a == 4 &&
-+      block_size % (32 / static_cast<uint32_t>(nbits)) == 0) {
++      block_size % (32 / static_cast<uint32_t>(nbits)) == 0 &&
++      // The kernel walks the block-padded K of B; A rows are only K long, so
++      // a partial last block would read the next row of A (or past its end).
++      K % block_size == 0) {
 +    constexpr uint32_t k_lanes = 32;
 +    constexpr uint32_t col_groups = 4;
 +    // Fewer columns per thread for more rows keeps the tile_m x cols_per_thread
@@ -132,10 +135,10 @@ index bf56d4f..9914357 100644
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
-index 0000000..f4107b1
+index 0000000..b2d0d90
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,115 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -173,6 +176,11 @@ index 0000000..f4107b1
 +var<workgroup> partials: array<array<output_element_t, k_lanes>, cols_per_wg>;
 +
 +$MAIN {
++  // A dispatch above 65535 workgroups is split into a 2-D grid that can hold
++  // more workgroups than asked for; the extra ones must not write.
++  if (workgroup_idx >= uniforms.num_N_tile * uniforms.batch_count) {
++    return;
++  }
 +  let batch = workgroup_idx / uniforms.num_N_tile;
 +  let n_base = (workgroup_idx % uniforms.num_N_tile) * cols_per_wg;
 +  let lane = local_idx % k_lanes;

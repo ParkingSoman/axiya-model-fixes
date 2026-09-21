@@ -42,7 +42,9 @@ git reset -q
 git checkout -- .
 git clean -fdq -- onnxruntime
 if [ "$PATCH" = 1 ]; then git apply --whitespace=nowarn "$patch_file"; fi
+git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
+git reset -q
 
 ( cd cmake/external/emsdk && ./emsdk install "$EMSDK_VERSION" >/dev/null && ./emsdk activate "$EMSDK_VERSION" >/dev/null )
 
@@ -80,6 +82,10 @@ fi
   --enable_reduced_operator_type_support \
   --emsdk_version "$EMSDK_VERSION"
 
+# The JS API is copied from the app's npm package, so it must be the same
+# onnxruntime version as the tag.
+npm_version="$(node -p "require('$app/node_modules/onnxruntime-web/package.json').version")"
+[ "$npm_version" = "${TAG#v}" ] || { echo "node_modules/onnxruntime-web is $npm_version, not ${TAG#v}" >&2; exit 1; }
 mkdir -p "$OUT"
 cp "$app"/node_modules/onnxruntime-web/dist/*.mjs "$app"/node_modules/onnxruntime-web/dist/*.wasm "$OUT"/
 cp "$BUILD_DIR/Release/ort-wasm-simd-threaded.asyncify.wasm" "$BUILD_DIR/Release/ort-wasm-simd-threaded.asyncify.mjs" "$OUT"/
