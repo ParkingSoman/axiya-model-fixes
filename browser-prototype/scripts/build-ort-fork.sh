@@ -72,10 +72,15 @@ elif [ "$PATCH" = 1 ]; then
   grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 0$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc || {
     echo "patch does not set ORT_FORK_DEBUG_FORCE_DP4A 0 (a debug patch?); refusing a normal build" >&2; exit 1; }
 fi
-if [ "$PATCH" = 1 ] && [ -z "${PATCH_FILE:-}" ]; then
-  # The default patch must carry the K3 parts (row-invariant attention and norms).
+if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$patch_file")" = "$app/reference/onnxruntime-webgpu.patch" ]; then
+  # The reference patch (however it was named) must carry every K3 part: the
+  # row-invariant attention kernel, the q/k norm fold for 1-16 tokens, and the
+  # one-workgroup-per-row LayerNorm and SkipLayerNorm. A PATCH_FILE that
+  # points at another file (an experiment) skips this check.
   grep -q 'FlashAttentionDecodeGQAProgram' onnxruntime/contrib_ops/webgpu/bert/flash_attention.h &&
-    grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc || {
+    grep -q 'decode_norm_fast_path = has_qk_norm && parameters.sequence_length_ <= 16' onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc &&
+    grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc &&
+    grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
