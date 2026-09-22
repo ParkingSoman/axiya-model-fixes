@@ -5,14 +5,19 @@
 # The patch (reference/onnxruntime-webgpu.patch) gives every row of a short
 # multi-token pass (2-16 tokens, a speculative verify pass) the same arithmetic
 # as a one-token decode step, and makes those passes cheap:
-#   - MatMulNBits: batched kernel for 2-16 rows; on DP4A GPUs the one-row DP4A
-#     kernel per row (K0).
 #   - GroupQueryAttention decode (1-16 new tokens): FlashAttentionDecodeGQA,
 #     one workgroup per (KV head, KV tile) for all query rows, fixed split-K
 #     (K3). One-token steps use it too.
 #   - q/k RMS norm folded into the rotary kernel for 1-16 tokens (K3).
 #   - LayerNorm/SkipLayerNorm: one workgroup per row for every row count; the
 #     one-row split path is off (K3).
+#   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
+#     activations) where one-token steps use DP4A, else float (float32 or
+#     float16), with the rows in a runtime loop; each weight is read once per
+#     tile of up to 16 rows. One-token steps use it too. Other 2-16-row cases
+#     run the one-row float program per row, never the prefill tile kernels.
+#   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
+#     (FUSED_DECODE below).
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -27,6 +32,12 @@
 #            (sets ORT_FORK_DEBUG_FORCE_DP4A in dp4a_matmul_nbits.cc), so a Mac
 #            runs the int8-activation arithmetic of Intel/AMD/NVIDIA GPUs. Needs
 #            PATCH=1. Test builds only; never ship one. Default 0.
+#   FUSED_DECODE 1 = one-token steps may use the fused MatMulNBitsMlp/Qkv decode
+#            programs (default). 0 = they take the same unfused path as 2-16-row
+#            passes (sets ORT_FORK_FUSED_DECODE in dp4a_matmul_nbits.h): the
+#            whole decoder is then bit-identical per row on Apple GPUs too, and
+#            one-token steps cost +2% to +9% on the M5 (evidence/k4-matmulnbits).
+#            Needs PATCH=1.
 #
 # The build flags are the ones the npm release uses for this file
 # (tools/ci_build/github/azure-pipelines/templates/{web-ci,linux-wasm-ci}.yml,
@@ -43,6 +54,7 @@ EMSDK_VERSION=4.0.23
 ORT_SRC="${ORT_SRC:?set ORT_SRC to the onnxruntime checkout folder}"
 PATCH="${PATCH:-1}"
 FORCE_DP4A="${FORCE_DP4A:-0}"
+FUSED_DECODE="${FUSED_DECODE:-1}"
 OUT="${OUT:?set OUT to the output dist folder}"
 BUILD_DIR="${BUILD_DIR:-$ORT_SRC/build/wasm_webgpu}"
 
@@ -72,6 +84,13 @@ elif [ "$PATCH" = 1 ]; then
   grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 0$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc || {
     echo "patch does not set ORT_FORK_DEBUG_FORCE_DP4A 0 (a debug patch?); refusing a normal build" >&2; exit 1; }
 fi
+if [ "$FUSED_DECODE" != 1 ]; then
+  [ "$FUSED_DECODE" = 0 ] && [ "$PATCH" = 1 ] || { echo "FUSED_DECODE must be 1 or 0 (0 needs PATCH=1)" >&2; exit 1; }
+  fused_src=onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
+  sed -i.bak 's/^#define ORT_FORK_FUSED_DECODE 1$/#define ORT_FORK_FUSED_DECODE 0/' "$fused_src" && rm -f "$fused_src.bak"
+  grep -q '^#define ORT_FORK_FUSED_DECODE 0$' "$fused_src" || { echo "could not set ORT_FORK_FUSED_DECODE 0" >&2; exit 1; }
+  echo "FUSED_DECODE=0: one-token steps skip the fused MLP/QKV decode programs"
+fi
 if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$patch_file")" = "$app/reference/onnxruntime-webgpu.patch" ]; then
   # The reference patch (however it was named) must carry every K3 part: the
   # row-invariant attention kernel, the q/k norm fold for 1-16 tokens, and the
@@ -82,6 +101,20 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc &&
     grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
+  # K4: MatMulNBits for 1-16 rows runs through one pipeline per path (DP4A or
+  # float) with the rows in a runtime loop, and 2-16 rows never reach the
+  # prefill tile kernels.
+  grep -q 'const bool batchable = M >= 1 && M <= kMaxBatchedM' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'ApplyDP4AMatMulNBitsBatched(a, b, scales' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'if (!small_m && CanApplySubgroupMatrixMatMulNBits' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'use_wide_tile_program = !small_m &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'DP4AMatMulNBitsBatchedProgram' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
+    grep -q '^#define ORT_FORK_FUSED_DECODE [01]$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
+    grep -q 'ORT_FORK_FUSED_DECODE != 0 &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc &&
+    grep -q 'M != 1 || ORT_FORK_FUSED_DECODE == 0' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc &&
+    grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
+    grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
+      echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
