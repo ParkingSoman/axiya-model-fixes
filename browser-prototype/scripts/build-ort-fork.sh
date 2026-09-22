@@ -16,6 +16,10 @@
 #     float16), with the rows in a runtime loop; each weight is read once per
 #     tile of up to 16 rows. One-token steps use it too. Other 2-16-row cases
 #     run the one-row float program per row, never the prefill tile kernels.
+#   - CausalConvWithState with state_window (K5): the WebGPU kernel keeps the
+#     conv state after each of the last W positions (W <= 16), so a speculative
+#     pass can roll back to an accepted prefix. The app fuses the decoder's
+#     conv layers into this op at load (VITE_CONV_STATE, src/conv-state.js).
 #   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
 #     (FUSED_DECODE below).
 #
@@ -115,6 +119,11 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
       echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }
+  # K5: CausalConvWithState state window on WebGPU, up to 16 slots.
+  grep -q 'constexpr int64_t kMaxStateWindow = 16;' onnxruntime/contrib_ops/cpu/bert/attention_common.h &&
+    grep -q 'ParseStateWindow(info, state_window_)' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc &&
+    grep -q '#if output_present_state && has_state_window' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template || {
+      echo "reference patch lacks the K5 CausalConvWithState state window; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
