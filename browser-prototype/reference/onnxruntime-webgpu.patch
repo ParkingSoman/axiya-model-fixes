@@ -1,5 +1,486 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
+index a800232..f743403 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
+@@ -919,6 +919,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
+   return context.RunProgram(program);
+ }
+ 
++Status FlashAttentionDecodeGQAProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& q = shader.AddInput("q", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  const auto& present_key = shader.AddInput("present_key", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  const auto& present_value = shader.AddInput("present_value", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  if (use_seqlen_k_) {
++    shader.AddInput("seqlens_k", ShaderUsage::None);
++  }
++  const auto& partials = shader.AddOutput("partials", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  const auto& metadata = shader.AddOutput("metadata", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  ORT_ENFORCE(WorkgroupSizeX() % tile_size_ == 0 && row_chunk_ % (WorkgroupSizeX() / tile_size_) == 0,
++              "FlashAttentionDecodeGQA: workgroup size must be a multiple of tile_size, and row_chunk of their ratio.");
++  return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention_decode_gqa.wgsl.template",
++                             WGSL_TEMPLATE_PARAMETER(head_size_vec, head_size_vec_),
++                             WGSL_TEMPLATE_PARAMETER(row_chunk, row_chunk_),
++                             WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
++                             WGSL_TEMPLATE_PARAMETER(use_seqlen_k, use_seqlen_k_),
++                             WGSL_TEMPLATE_VARIABLE(metadata, metadata),
++                             WGSL_TEMPLATE_VARIABLE(partials, partials),
++                             WGSL_TEMPLATE_VARIABLE(present_key, present_key),
++                             WGSL_TEMPLATE_VARIABLE(present_value, present_value),
++                             WGSL_TEMPLATE_VARIABLE(q, q));
++}
++
++Status FlashAttentionDecodeGQAReduceProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  const auto& partials = shader.AddInput("partials", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  const auto& metadata = shader.AddInput("metadata", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  if (use_seqlen_k_) {
++    shader.AddInput("seqlens_k", ShaderUsage::None);
++  }
++  const auto& output = shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  return WGSL_TEMPLATE_APPLY(shader, "bert/flash_attention_decode_gqa_reduce.wgsl.template",
++                             WGSL_TEMPLATE_PARAMETER(tile_size, tile_size_),
++                             WGSL_TEMPLATE_PARAMETER(use_seqlen_k, use_seqlen_k_),
++                             WGSL_TEMPLATE_VARIABLE(metadata, metadata),
++                             WGSL_TEMPLATE_VARIABLE(output, output),
++                             WGSL_TEMPLATE_VARIABLE(partials, partials));
++}
++
++// Batched-int4 fork: multi-query GQA decode for 1 <= sequence_length <= 16.
++// Replaces FlashAttentionDecodeQKV + VxReduce there, for one-token steps too,
++// so that a k-token verify pass and k one-token steps give each query row the
++// same bits (the stock kernel changes its tiling and summation order with the
++// row count). K/V tiles are read once per KV head instead of once per query
++// head and query tile.
++bool CanApplyFlashAttentionDecodeGQA(const WebgpuAttentionParameters& parameters, const Tensor* attention_bias,
++                                     const Tensor* head_sink, bool use_paged_kv_cache,
++                                     bool kv_cache_quantization_enabled, bool use_seqlens_q,
++                                     bool use_indirect_dispatch) {
++  return !use_paged_kv_cache && !kv_cache_quantization_enabled && !use_seqlens_q && !use_indirect_dispatch &&
++         attention_bias == nullptr && head_sink == nullptr &&
++         parameters.qkv_format_ != Q_K_V_BNSH && parameters.is_unidirectional_ &&
++         parameters.sequence_length_ >= 1 && parameters.sequence_length_ <= 16 &&
++         parameters.v_head_size_ == parameters.head_size_ && parameters.head_size_ % 4 == 0 &&
++         parameters.head_size_ <= 128 && parameters.is_gqa_ && parameters.n_reps >= 1 &&
++         parameters.num_heads_ == parameters.n_reps * parameters.kv_num_heads_ &&
++         parameters.total_sequence_length_ > 0;
++}
++
++Status ComputeFlashAttentionDecodeGQA(onnxruntime::webgpu::ComputeContext& context, const Tensor* Q,
++                                      const Tensor* present_key, const Tensor* present_value, const Tensor* seqlen_k,
++                                      Tensor* output, const WebgpuAttentionParameters& parameters,
++                                      uint32_t present_sequence_length) {
++  constexpr uint32_t tile_size = 64;
++  constexpr uint32_t row_chunk = 16;
++  constexpr uint32_t workgroup_size = 128;
++  const bool use_seqlen_k = seqlen_k != nullptr;
++  const uint32_t head_size_vec = static_cast<uint32_t>(parameters.head_size_ / 4);
++  const uint32_t S = static_cast<uint32_t>(parameters.sequence_length_);
++  const uint32_t B = static_cast<uint32_t>(parameters.batch_size_);
++  const uint32_t num_heads = static_cast<uint32_t>(parameters.num_heads_);
++  const uint32_t kv_num_heads = static_cast<uint32_t>(parameters.kv_num_heads_);
++  const uint32_t n_reps = static_cast<uint32_t>(parameters.n_reps);
++  const uint32_t total = static_cast<uint32_t>(parameters.total_sequence_length_);
++  const uint32_t num_tiles = (total + tile_size - 1) / tile_size;
++  const float alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
++                                                : parameters.scale_;
++  const int64_t rows = static_cast<int64_t>(B) * num_heads * S;
++
++  Tensor metadata = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), TensorShape({rows, static_cast<int64_t>(num_tiles), 2}));
++  Tensor partials = context.CreateGPUTensor(DataTypeImpl::GetType<float>(),
++                                            TensorShape({rows, static_cast<int64_t>(num_tiles), static_cast<int64_t>(parameters.head_size_)}));
++
++  FlashAttentionDecodeGQAProgram program{head_size_vec, row_chunk, tile_size, use_seqlen_k};
++  program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {present_key, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {present_value, ProgramTensorMetadataDependency::TypeAndRank, 4}});
++  if (use_seqlen_k) {
++    program.AddInput({seqlen_k, ProgramTensorMetadataDependency::None});
++  }
++  program.AddOutputs({{&partials, ProgramTensorMetadataDependency::Rank, 4},
++                      {&metadata, ProgramTensorMetadataDependency::Rank, 2}});
++  // The cache key leaves out the sequence length on purpose: every row count
++  // runs the same pipeline.
++  program.SetDispatchGroupSize(B * kv_num_heads * num_tiles)
++      .SetWorkgroupSize(workgroup_size)
++      .CacheHint(head_size_vec, row_chunk, tile_size, use_seqlen_k)
++      .AddUniformVariables({{S},
++                            {total},
++                            {present_sequence_length},
++                            {n_reps},
++                            {num_heads},
++                            {kv_num_heads},
++                            {B},
++                            {num_tiles},
++                            {alpha}});
++  ORT_RETURN_IF_ERROR(context.RunProgram(program));
++
++  const uint32_t output_count = static_cast<uint32_t>(rows) * head_size_vec;
++  FlashAttentionDecodeGQAReduceProgram reduce{tile_size, use_seqlen_k};
++  reduce.AddInputs({{&partials, ProgramTensorMetadataDependency::Rank, 4},
++                    {&metadata, ProgramTensorMetadataDependency::Rank, 2}});
++  if (use_seqlen_k) {
++    reduce.AddInput({seqlen_k, ProgramTensorMetadataDependency::None});
++  }
++  reduce.AddOutput({output, ProgramTensorMetadataDependency::TypeAndRank, 4});
++  reduce.SetDispatchGroupSize((output_count + 63) / 64)
++      .SetWorkgroupSize(64)
++      .CacheHint(tile_size, use_seqlen_k)
++      .AddUniformVariables({{output_count},
++                            {head_size_vec},
++                            {S},
++                            {total},
++                            {num_heads},
++                            {num_tiles}});
++  return context.RunProgram(reduce);
++}
++
+ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
+                            Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
+                            const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context, const Tensor* seqlen_k,
+@@ -1366,6 +1493,11 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+ 
+       ORT_RETURN_IF_ERROR(context.RunProgram(program));
+     }
++  } else if (CanApplyFlashAttentionDecodeGQA(parameters, attention_bias, head_sink, use_paged_kv_cache,
++                                             kv_cache_quantization_enabled, use_seqlens_q, use_indirect_dispatch)) {
++    ORT_RETURN_IF_ERROR(ComputeFlashAttentionDecodeGQA(context, Q, present_key, present_value,
++                                                       use_seqlen_k ? seqlen_k : nullptr, attn_output, parameters,
++                                                       present_sequence_length));
+   } else {
+     // Split-reduce path (fused QKV + VxReduce). Handles quantized and unquantized caches.
+     const uint32_t num_total_seq_length_tile = (parameters.total_sequence_length_ + tile_size - 1) / tile_size;
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
+index 3e4c16c..a92d688 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
+@@ -272,6 +272,53 @@ class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionD
+   bool use_seqlen_k_;
+ };
+ 
++// Multi-query GQA decode (1 <= new sequence length <= 16): one workgroup per
++// (batch, KV head, KV tile) for all query rows of the group. Each query row
++// gets the same bits for every new sequence length. See
++// flash_attention_decode_gqa.wgsl.template.
++class FlashAttentionDecodeGQAProgram final : public Program<FlashAttentionDecodeGQAProgram> {
++ public:
++  FlashAttentionDecodeGQAProgram(uint32_t head_size_vec, uint32_t row_chunk, uint32_t tile_size, bool use_seqlen_k)
++      : Program{"FlashAttentionDecodeGQA"}, head_size_vec_(head_size_vec), row_chunk_(row_chunk), tile_size_(tile_size), use_seqlen_k_(use_seqlen_k) {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"new_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"total_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"present_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"n_reps", ProgramUniformVariableDataType::Uint32},
++                                          {"num_heads", ProgramUniformVariableDataType::Uint32},
++                                          {"kv_num_heads", ProgramUniformVariableDataType::Uint32},
++                                          {"batch_size", ProgramUniformVariableDataType::Uint32},
++                                          {"num_tiles", ProgramUniformVariableDataType::Uint32},
++                                          {"alpha", ProgramUniformVariableDataType::Float32});
++
++ private:
++  uint32_t head_size_vec_;
++  uint32_t row_chunk_;
++  uint32_t tile_size_;
++  bool use_seqlen_k_;
++};
++
++class FlashAttentionDecodeGQAReduceProgram final : public Program<FlashAttentionDecodeGQAReduceProgram> {
++ public:
++  FlashAttentionDecodeGQAReduceProgram(uint32_t tile_size, bool use_seqlen_k)
++      : Program{"FlashAttentionDecodeGQAReduce"}, tile_size_(tile_size), use_seqlen_k_(use_seqlen_k) {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"output_count", ProgramUniformVariableDataType::Uint32},
++                                          {"head_size_vec", ProgramUniformVariableDataType::Uint32},
++                                          {"new_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"total_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"num_heads", ProgramUniformVariableDataType::Uint32},
++                                          {"num_tiles", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  uint32_t tile_size_;
++  bool use_seqlen_k_;
++};
++
+ // Phase 2 scaffold: keep baseline decode programs untouched by adding paged variants.
+ class FlashAttentionPagedDecodeQKVProgram final : public Program<FlashAttentionPagedDecodeQKVProgram> {
+  public:
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa.wgsl.template
+new file mode 100644
+index 0000000..010733f
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa.wgsl.template
+@@ -0,0 +1,170 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#param head_size_vec
++#param row_chunk
++#param tile_size
++#param use_seqlen_k
++
++#use .getByOffset .setByOffset
++
++// Multi-query GQA decode attention, split-K over the KV sequence (1 <= new
++// sequence length <= 16, e.g. one decode step or a speculative verify pass).
++//
++// One workgroup handles one (batch, KV head, KV tile of tile_size positions)
++// for every query row that reads that KV head: all new positions times all
++// n_reps query heads of the group. So each K/V tile is read from memory once
++// per pass, not once per query head and query tile.
++//
++// Each query row gets the same arithmetic for every new sequence length:
++//  - the KV split is fixed (tiles at multiples of tile_size from position 0);
++//  - a row reads only the keys it may see (causal end = past + s + 1), so a
++//    row of a k-token pass reads exactly the keys that a one-token pass at the
++//    same position reads, and no masked key is added in as zero;
++//  - every sum runs in a fixed order that depends on neither the row count
++//    nor the row's place in the workgroup;
++//  - the same pipeline runs for every row count (the count is a uniform).
++// So row s of a k-token pass has the same bits as a one-token pass at
++// position past + s. FlashAttentionDecodeGQAReduce then merges the tiles of
++// each row, in tile order.
++//
++// Per tile, per row: max and sum of exp (online softmax), the normalized
++// weights, and weights x V. Outputs: metadata (max, sum) and the partial
++// output, both float32, indexed by row = (batch * num_heads + q_head) *
++// new_sequence_length + s.
++
++const HV: u32 = head_size_vec;
++const RC: u32 = row_chunk;
++const T: u32 = tile_size;
++// Threads per key in the score phase, and rows per thread.
++const R_STRIDE: u32 = workgroup_size_x / T;
++const ROWS_PER_THREAD: u32 = RC / R_STRIDE;
++
++var<workgroup> q_sh: array<array<vec4<f32>, HV>, RC>;
++var<workgroup> s_sh: array<array<f32, T>, RC>;
++var<workgroup> cnt_sh: array<u32, RC>;
++var<workgroup> max_sh: array<f32, RC>;
++var<workgroup> sum_sh: array<f32, RC>;
++
++$MAIN {
++  let num_tiles = uniforms.num_tiles;
++  let tile_idx = workgroup_idx % num_tiles;
++  let batch_kv_head = workgroup_idx / num_tiles;
++  let kv_head = batch_kv_head % uniforms.kv_num_heads;
++  let batch = batch_kv_head / uniforms.kv_num_heads;
++  if (batch >= uniforms.batch_size) {
++    return;
++  }
++#if use_seqlen_k
++  let total = u32(seqlens_k[batch]) + 1u;
++#else
++  let total = uniforms.total_sequence_length;
++#endif
++  let tile_start = tile_idx * T;
++  if (tile_start >= total) {
++    return;
++  }
++  let S = uniforms.new_sequence_length;
++  let n_reps = uniforms.n_reps;
++  let past = select(total - S, 0u, total <= S);
++  let rows = S * n_reps;
++  // Row index of present_key/present_value (BNSH), in units of head_size_vec vec4s.
++  let kv_row_base = (batch * uniforms.kv_num_heads + kv_head) * uniforms.present_sequence_length;
++  let t_local = local_idx % T;
++  let r_sub = local_idx / T;
++
++  for (var chunk = 0u; chunk < rows; chunk += RC) {
++    // Load the chunk's query rows, scaled by alpha, and each row's key count
++    // in this tile.
++    for (var i = local_idx; i < RC * HV; i += workgroup_size_x) {
++      let rr = i / HV;
++      let d = i % HV;
++      let r = chunk + rr;
++      if (r < rows) {
++        let s = r / n_reps;
++        let q_head = kv_head * n_reps + r % n_reps;
++        let q_off = ((batch * S + s) * uniforms.num_heads + q_head) * HV + d;
++        q_sh[rr][d] = vec4<f32>(q.getByOffset(q_off)) * uniforms.alpha;
++      }
++    }
++    if (local_idx < RC) {
++      let r = chunk + local_idx;
++      var cnt = 0u;
++      if (r < rows) {
++        let valid_end = min(total, past + r / n_reps + 1u);
++        if (valid_end > tile_start) {
++          cnt = min(valid_end - tile_start, T);
++        }
++      }
++      cnt_sh[local_idx] = cnt;
++    }
++    workgroupBarrier();
++
++    // Scores: thread (t_local, r_sub) takes key t_local of the tile against
++    // rows r_sub, r_sub + R_STRIDE, ... Each score is one dot product summed
++    // over d = 0 .. HV-1 in order.
++    let key_pos = tile_start + t_local;
++    if (key_pos < total) {
++      var acc: array<f32, ROWS_PER_THREAD>;
++      for (var d = 0u; d < HV; d++) {
++        let k_vec = vec4<f32>(present_key.getByOffset((kv_row_base + key_pos) * HV + d));
++        for (var j = 0u; j < ROWS_PER_THREAD; j++) {
++          acc[j] += dot(k_vec, q_sh[r_sub + j * R_STRIDE][d]);
++        }
++      }
++      for (var j = 0u; j < ROWS_PER_THREAD; j++) {
++        s_sh[r_sub + j * R_STRIDE][t_local] = acc[j];
++      }
++    }
++    workgroupBarrier();
++
++    // Per row: max and sum of exp over the row's keys, in key order.
++    if (local_idx < RC) {
++      let cnt = cnt_sh[local_idx];
++      var m = f32(-3.4028234663852886e+38f);
++      for (var t = 0u; t < cnt; t++) {
++        m = max(m, s_sh[local_idx][t]);
++      }
++      var l = f32(0);
++      for (var t = 0u; t < cnt; t++) {
++        l += exp(s_sh[local_idx][t] - m);
++      }
++      max_sh[local_idx] = m;
++      sum_sh[local_idx] = l;
++      let r = chunk + local_idx;
++      if (cnt > 0u) {
++        let row = (batch * uniforms.num_heads + kv_head * n_reps + r % n_reps) * S + r / n_reps;
++        metadata.setByOffset(row * num_tiles + tile_idx, vec2<f32>(m, l));
++      }
++    }
++    workgroupBarrier();
++
++    // Normalized weights, in place.
++    for (var j = 0u; j < ROWS_PER_THREAD; j++) {
++      let rr = r_sub + j * R_STRIDE;
++      if (t_local < cnt_sh[rr]) {
++        s_sh[rr][t_local] = exp(s_sh[rr][t_local] - max_sh[rr]) / sum_sh[rr];
++      }
++    }
++    workgroupBarrier();
++
++    // Weights x V: one (row, vec4 of the head) per thread, summed over the
++    // row's keys in order.
++    for (var i = local_idx; i < RC * HV; i += workgroup_size_x) {
++      let rr = i / HV;
++      let d = i % HV;
++      let r = chunk + rr;
++      let cnt = cnt_sh[rr];
++      if (r < rows && cnt > 0u) {
++        var acc = vec4<f32>(0);
++        for (var t = 0u; t < cnt; t++) {
++          let v_vec = vec4<f32>(present_value.getByOffset((kv_row_base + tile_start + t) * HV + d));
++          acc += v_vec * s_sh[rr][t];
++        }
++        let row = (batch * uniforms.num_heads + kv_head * n_reps + r % n_reps) * S + r / n_reps;
++        partials.setByOffset((row * num_tiles + tile_idx) * HV + d, acc);
++      }
++    }
++    workgroupBarrier();
++  }
++}  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa_reduce.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa_reduce.wgsl.template
+new file mode 100644
+index 0000000..4b3ab14
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa_reduce.wgsl.template
+@@ -0,0 +1,56 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#param tile_size
++#param use_seqlen_k
++
++#use .getByOffset .setByOffset
++
++// Merges the per-tile results of FlashAttentionDecodeGQA. One thread per
++// (row, vec4 of the head). A row reads only its own tiles (those that hold a
++// key it may see), in tile order, so its result does not depend on the new
++// sequence length:
++//
++//   g_max  = max over tiles of m_i
++//   g_sum  = sum over tiles of l_i * exp(m_i - g_max)
++//   out[d] = sum over tiles of partial_i[d] * (l_i * exp(m_i - g_max) / g_sum)
++
++$MAIN {
++  if (global_idx >= uniforms.output_count) {
++    return;
++  }
++  let HV = uniforms.head_size_vec;
++  let S = uniforms.new_sequence_length;
++  let num_tiles = uniforms.num_tiles;
++  let d = global_idx % HV;
++  let row = global_idx / HV;
++  let s = row % S;
++  let batch_head = row / S;
++  let q_head = batch_head % uniforms.num_heads;
++  let batch = batch_head / uniforms.num_heads;
++#if use_seqlen_k
++  let total = u32(seqlens_k[batch]) + 1u;
++#else
++  let total = uniforms.total_sequence_length;
++#endif
++  let past = select(total - S, 0u, total <= S);
++  let valid_end = min(total, past + s + 1u);
++  let n = (valid_end + tile_size - 1u) / tile_size;
++  let meta_base = row * num_tiles;
++
++  var g_max = f32(-3.4028234663852886e+38f);
++  for (var i = 0u; i < n; i++) {
++    g_max = max(g_max, metadata.getByOffset(meta_base + i).x);
++  }
++  var g_sum = f32(0);
++  for (var i = 0u; i < n; i++) {
++    let m = metadata.getByOffset(meta_base + i);
++    g_sum += m.y * exp(m.x - g_max);
++  }
++  var acc = vec4<f32>(0);
++  for (var i = 0u; i < n; i++) {
++    let m = metadata.getByOffset(meta_base + i);
++    acc += partials.getByOffset((meta_base + i) * HV + d) * (m.y * exp(m.x - g_max) / g_sum);
++  }
++  output.setByOffset(((batch * S + s) * uniforms.num_heads + q_head) * HV + d, output_value_t(acc));
++}  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc
+index 00807f3..57b5b63 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc
+@@ -475,7 +475,13 @@ Status GroupQueryAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
+       const Tensor* k_for_rotary = key;
+       const Tensor* q_norm_for_fused = nullptr;
+       const Tensor* k_norm_for_fused = nullptr;
+-      const bool decode_norm_fast_path = has_qk_norm && parameters.sequence_length_ == 1;
++      // Batched-int4 fork: a short multi-token pass (sequence_length <= 16, e.g.
++      // a speculative verify pass) also takes the fused per-row norm, so each
++      // of its rows gets the same arithmetic as a one-token decode step. With
++      // the standalone norm the rows differ in the last bits, and on GPUs where
++      // MatMulNBits quantizes activations to int8 (DP4A) such differences grow
++      // into different tokens.
++      const bool decode_norm_fast_path = has_qk_norm && parameters.sequence_length_ <= 16;
+       if (has_qk_norm && !decode_norm_fast_path) {
+         qNorm = context.CreateGPUTensor(query->DataType(), query->Shape());
+         kNorm = context.CreateGPUTensor(key->DataType(), key->Shape());
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+index c0e3b74..a1bf44f 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+@@ -177,7 +177,10 @@ Status RunSkipLayerNormProgram(ComputeContext& context,
+   const int components = GetMaxComponents(hidden_size);
+   const bool has_input_skip_bias_sum = input_skip_bias_sum != nullptr;
+   const uint32_t norm_count = onnxruntime::narrow<uint32_t>(x_shape.SizeToDimension(x_shape.NumDimensions() - 1));
+-  const bool split_hidden_dim = hidden_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never split one row over workgroups. The split path
++  // runs only for one row and sums in another order, so a one-token decode step
++  // and a k-token verify pass would normalize the same row to different bits.
++  const bool split_hidden_dim = false && hidden_size % 512 == 0 && norm_count == 1;
+ 
+   const uint32_t skip_size = onnxruntime::narrow<uint32_t>(skip->Shape().Size());
+ 
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
-index e936833..aead61a 100644
+index e936833..50acfe8 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
 @@ -5,6 +5,13 @@
@@ -298,3 +779,21 @@ index 0000000..b2d0d90
 +    workgroupBarrier();
 +  }
 +}  // MAIN
+diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+index b303182..85903e3 100644
+--- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+@@ -208,7 +208,12 @@ Status RunLayerNormProgram(ComputeContext& context,
+   const uint32_t norm_size_vectorized = onnxruntime::narrow<uint32_t>((norm_size + components - 1) / components);
+ 
+   // Check if we should use split norm dimension optimization
+-  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never. The split path runs only for one row and sums in
++  // another order than the one-workgroup-per-row path, so a one-token decode
++  // step and a k-token verify pass would normalize the same row to different
++  // bits. On GPUs where MatMulNBits quantizes activations to int8 (DP4A) such
++  // differences grow into different tokens.
++  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+ 
+   LayerNormProgram program{bias != nullptr, simplified, mean != nullptr, inv_std_dev != nullptr, split_norm_dim};
+ 

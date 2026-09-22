@@ -2,6 +2,18 @@
 # Builds onnxruntime-web's WebGPU wasm (ort-wasm-simd-threaded.asyncify.{wasm,mjs})
 # from the onnxruntime v1.30.0 tag, with or without the batched-int4 patch.
 #
+# The patch (reference/onnxruntime-webgpu.patch) gives every row of a short
+# multi-token pass (2-16 tokens, a speculative verify pass) the same arithmetic
+# as a one-token decode step, and makes those passes cheap:
+#   - MatMulNBits: batched kernel for 2-16 rows; on DP4A GPUs the one-row DP4A
+#     kernel per row (K0).
+#   - GroupQueryAttention decode (1-16 new tokens): FlashAttentionDecodeGQA,
+#     one workgroup per (KV head, KV tile) for all query rows, fixed split-K
+#     (K3). One-token steps use it too.
+#   - q/k RMS norm folded into the rotary kernel for 1-16 tokens (K3).
+#   - LayerNorm/SkipLayerNorm: one workgroup per row for every row count; the
+#     one-row split path is off (K3).
+#
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
 # Env:
@@ -59,6 +71,17 @@ elif [ "$PATCH" = 1 ]; then
   # tree that a FORCE_DP4A=1 build left at 1.
   grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 0$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc || {
     echo "patch does not set ORT_FORK_DEBUG_FORCE_DP4A 0 (a debug patch?); refusing a normal build" >&2; exit 1; }
+fi
+if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$patch_file")" = "$app/reference/onnxruntime-webgpu.patch" ]; then
+  # The reference patch (however it was named) must carry every K3 part: the
+  # row-invariant attention kernel, the q/k norm fold for 1-16 tokens, and the
+  # one-workgroup-per-row LayerNorm and SkipLayerNorm. A PATCH_FILE that
+  # points at another file (an experiment) skips this check.
+  grep -q 'FlashAttentionDecodeGQAProgram' onnxruntime/contrib_ops/webgpu/bert/flash_attention.h &&
+    grep -q 'decode_norm_fast_path = has_qk_norm && parameters.sequence_length_ <= 16' onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc &&
+    grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc &&
+    grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
+      echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
