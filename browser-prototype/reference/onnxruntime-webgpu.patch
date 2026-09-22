@@ -12,7 +12,7 @@ index 0c419ff..7f7a899 100644
  namespace sparse_attention {
  // Environment variable to enable or disable sparse attention v1 kernel. Default is 0 (enabled).
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
-index a47b313..a66be5a 100644
+index a47b313..d0e0f33 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
 +++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
 @@ -44,8 +44,10 @@ CausalConvWithState::CausalConvWithState(const OpKernelInfo& info)
@@ -28,14 +28,14 @@ index a47b313..a66be5a 100644
  }
  
  Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) const {
-@@ -69,6 +71,7 @@ Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) cons
+@@ -68,6 +70,7 @@ Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) cons
+                              WGSL_TEMPLATE_PARAMETER(channels_last, channels_last_),
                               WGSL_TEMPLATE_PARAMETER(has_bias, has_bias_),
                               WGSL_TEMPLATE_PARAMETER(has_conv_state, has_conv_state_),
-                              WGSL_TEMPLATE_PARAMETER(output_present_state, output_present_state_),
 +                             WGSL_TEMPLATE_PARAMETER(has_state_window, state_window_ > 0),
+                              WGSL_TEMPLATE_PARAMETER(output_present_state, output_present_state_),
                               WGSL_TEMPLATE_PARAMETER(use_silu, activation_ == CausalConvActivation::Silu));
  }
- 
 @@ -165,6 +168,11 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
    } else {
      state_dims = TensorShapeVector{batch_size, channels, state_length};
