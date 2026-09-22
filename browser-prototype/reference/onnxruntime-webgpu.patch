@@ -762,10 +762,10 @@ index e936833..24738bc 100644
          components_k == 4 && K % 128 == 0 && N % 16 == 0 &&
          use_dp4a)) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-index 49b51d3..f5abb9e 100644
+index 49b51d3..776af50 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-@@ -14,6 +14,21 @@ namespace webgpu {
+@@ -14,6 +14,24 @@ namespace webgpu {
  
  using namespace onnxruntime::webgpu;
  
@@ -779,15 +779,18 @@ index 49b51d3..f5abb9e 100644
 +// MatMulNBitsMlpDecode / MatMulNBitsQkvDecode programs (stock behaviour).
 +// 0 = they take the same unfused path as 2-16-row passes (norm program, then
 +// MatMulNBits), so a one-token step and a row of a k-token pass run the same
-+// kernels and give the same bits.
++// kernels and give the same bits. Default 1: turning the fused programs off
++// makes the whole decoder bit-identical per row on Apple GPUs, but one-token
++// steps cost +2% to +9% on the M5 (evidence/k4-matmulnbits). Build with
++// FUSED_DECODE=0 (build-ort-fork.sh) to choose identity.
 +#ifndef ORT_FORK_FUSED_DECODE
-+#define ORT_FORK_FUSED_DECODE 0
++#define ORT_FORK_FUSED_DECODE 1
 +#endif
 +
  class DP4AMatMulQuantizeProgram final : public Program<DP4AMatMulQuantizeProgram> {
   public:
    DP4AMatMulQuantizeProgram() : Program{"DP4AMatMulQuantize"} {}
-@@ -97,6 +112,63 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
+@@ -97,6 +115,63 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
    bool broadcast_a_row_;
  };
  

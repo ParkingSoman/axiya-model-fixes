@@ -16,9 +16,8 @@
 #     float16), with the rows in a runtime loop; each weight is read once per
 #     tile of up to 16 rows. One-token steps use it too. Other 2-16-row cases
 #     run the one-row float program per row, never the prefill tile kernels.
-#   - Fused MatMulNBitsMlp/Qkv one-token decode programs: switch
-#     ORT_FORK_FUSED_DECODE in dp4a_matmul_nbits.h (K4 fix 1; 0 = one-token
-#     steps take the same unfused path as 2-16-row passes).
+#   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
+#     (FUSED_DECODE below).
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -33,6 +32,12 @@
 #            (sets ORT_FORK_DEBUG_FORCE_DP4A in dp4a_matmul_nbits.cc), so a Mac
 #            runs the int8-activation arithmetic of Intel/AMD/NVIDIA GPUs. Needs
 #            PATCH=1. Test builds only; never ship one. Default 0.
+#   FUSED_DECODE 1 = one-token steps may use the fused MatMulNBitsMlp/Qkv decode
+#            programs (default). 0 = they take the same unfused path as 2-16-row
+#            passes (sets ORT_FORK_FUSED_DECODE in dp4a_matmul_nbits.h): the
+#            whole decoder is then bit-identical per row on Apple GPUs too, and
+#            one-token steps cost +2% to +9% on the M5 (evidence/k4-matmulnbits).
+#            Needs PATCH=1.
 #
 # The build flags are the ones the npm release uses for this file
 # (tools/ci_build/github/azure-pipelines/templates/{web-ci,linux-wasm-ci}.yml,
@@ -49,6 +54,7 @@ EMSDK_VERSION=4.0.23
 ORT_SRC="${ORT_SRC:?set ORT_SRC to the onnxruntime checkout folder}"
 PATCH="${PATCH:-1}"
 FORCE_DP4A="${FORCE_DP4A:-0}"
+FUSED_DECODE="${FUSED_DECODE:-1}"
 OUT="${OUT:?set OUT to the output dist folder}"
 BUILD_DIR="${BUILD_DIR:-$ORT_SRC/build/wasm_webgpu}"
 
@@ -77,6 +83,13 @@ elif [ "$PATCH" = 1 ]; then
   # tree that a FORCE_DP4A=1 build left at 1.
   grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 0$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc || {
     echo "patch does not set ORT_FORK_DEBUG_FORCE_DP4A 0 (a debug patch?); refusing a normal build" >&2; exit 1; }
+fi
+if [ "$FUSED_DECODE" != 1 ]; then
+  [ "$FUSED_DECODE" = 0 ] && [ "$PATCH" = 1 ] || { echo "FUSED_DECODE must be 1 or 0 (0 needs PATCH=1)" >&2; exit 1; }
+  fused_src=onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
+  sed -i.bak 's/^#define ORT_FORK_FUSED_DECODE 1$/#define ORT_FORK_FUSED_DECODE 0/' "$fused_src" && rm -f "$fused_src.bak"
+  grep -q '^#define ORT_FORK_FUSED_DECODE 0$' "$fused_src" || { echo "could not set ORT_FORK_FUSED_DECODE 0" >&2; exit 1; }
+  echo "FUSED_DECODE=0: one-token steps skip the fused MLP/QKV decode programs"
 fi
 if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$patch_file")" = "$app/reference/onnxruntime-webgpu.patch" ]; then
   # The reference patch (however it was named) must carry every K3 part: the
