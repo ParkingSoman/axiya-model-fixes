@@ -1,5 +1,32 @@
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
+index e936833..aead61a 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
+@@ -5,6 +5,13 @@
+ #include "contrib_ops/webgpu/quantization/matmul_nbits_common.h"
+ #include "core/providers/webgpu/shader_helper.h"
+ 
++// Debug switch, batched-int4 fork only. 1 = take the DP4A path on Apple GPUs
++// too, so a Mac runs the MatMulNBits arithmetic that Intel, AMD and NVIDIA
++// GPUs run. Set by build-ort-fork.sh FORCE_DP4A=1; never set in a shipped build.
++#ifndef ORT_FORK_DEBUG_FORCE_DP4A
++#define ORT_FORK_DEBUG_FORCE_DP4A 0
++#endif
++
+ namespace onnxruntime {
+ namespace contrib {
+ namespace webgpu {
+@@ -207,7 +214,7 @@ bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
+   // https://github.com/gpuweb/gpuweb/issues/2677#issuecomment-1713292226
+   // Use 'vendor' to check for metal; 'backend' is always WEBGPU when running under wasm.
+   bool use_dp4a = context.HasFeature(wgpu::FeatureName::Subgroups) &&
+-                  context.AdapterInfo().vendor != std::string_view{"apple"};
++                  (ORT_FORK_DEBUG_FORCE_DP4A || context.AdapterInfo().vendor != std::string_view{"apple"});
+   if (!(accuracy_level == 4 && block_size % 32 == 0 &&
+         components_k == 4 && K % 128 == 0 && N % 16 == 0 &&
+         use_dp4a)) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..8e9b04a 100644
+index 45baa67..3352228 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -112,6 +112,35 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -38,19 +65,36 @@ index 45baa67..8e9b04a 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,6 +251,55 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,6 +251,72 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
-+  // Batched small-M path (2 <= M <= 16), e.g. a speculative verify pass. The
-+  // M=1 program below dispatches one workgroup per row, so M rows read and
-+  // dequantize all of B M times, and the wide-tile program (M >= 4) is built
-+  // for prefill. MatMulNBitsBatchedProgram reads each weight word once for all
-+  // rows. It takes precedence over the other paths for this M range, so every
-+  // device runs the same kernel for a short multi-token pass.
++  // Small-M passes (2 <= M <= 16), e.g. a speculative verify pass. Each row
++  // must get the same arithmetic as a one-row (M = 1) call on this adapter, so
++  // that a k-token pass and k plain decode steps pick the same tokens.
 +  constexpr uint32_t kMinBatchedM = 2;
 +  constexpr uint32_t kMaxBatchedM = 16;
-+  if ((nbits == 4 || nbits == 8) && M >= kMinBatchedM && M <= kMaxBatchedM && dispatch_M == M &&
++  const bool small_m = M >= kMinBatchedM && M <= kMaxBatchedM;
++  // Where M = 1 takes the DP4A path (int8 activations: every non-Apple GPU
++  // with subgroups at accuracy_level 4 and float32 output, and Qualcomm), a
++  // small-M pass takes the DP4A one-row kernel for every row. Its rows are
++  // computed exactly like M = 1 (one workgroup per row, A quantized per
++  // 128-element block). Stock onnxruntime would switch to the DP4A tile kernel
++  // at M >= 4, whose sums run in a different order.
++  if (small_m &&
++      CanApplyDP4AMatrixMatMulNBits(context, accuracy_level, block_size, N, K, components_a,
++                                    /*M=*/1u, has_weight_idx_indirect, y)) {
++    return ApplyDP4AMatrixMatMulNBits(a, b, scales, zero_points, bias, batch_count, M, dispatch_M, N, K, block_size,
++                                      zero_blocks_per_col, /*min_M_for_tile_optimization=*/kMaxBatchedM + 1,
++                                      static_cast<uint32_t>(nbits), context, y, weight_index, weight_index_indirect);
++  }
++
++  // Elsewhere M = 1 dequantizes B to the activation type (float32 or float16)
++  // and takes dot products in that type. MatMulNBitsBatchedProgram does the
++  // same, but reads each weight word once for all rows instead of once per
++  // row. The M = 1 program below dispatches one workgroup per row, and the
++  // wide-tile program (M >= 4) is built for prefill.
++  if ((nbits == 4 || nbits == 8) && small_m && dispatch_M == M &&
 +      !has_weight_idx && !single_scale_weights && components_a == 4 &&
 +      block_size % (32 / static_cast<uint32_t>(nbits)) == 0 &&
 +      // The kernel walks the block-padded K of B; A rows are only K long, so

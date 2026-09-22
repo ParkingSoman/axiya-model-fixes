@@ -10,6 +10,11 @@
 #   OUT      folder that receives a full onnxruntime-web dist: the npm 1.30.0 dist
 #            files, with the two asyncify files replaced by this build
 #   BUILD_DIR  cmake build folder (default $ORT_SRC/build/wasm_webgpu)
+#   PATCH_FILE patch to apply when PATCH=1 (default reference/onnxruntime-webgpu.patch)
+#   FORCE_DP4A 1 = debug build: the DP4A MatMulNBits path also runs on Apple GPUs
+#            (sets ORT_FORK_DEBUG_FORCE_DP4A in dp4a_matmul_nbits.cc), so a Mac
+#            runs the int8-activation arithmetic of Intel/AMD/NVIDIA GPUs. Needs
+#            PATCH=1. Test builds only; never ship one. Default 0.
 #
 # The build flags are the ones the npm release uses for this file
 # (tools/ci_build/github/azure-pipelines/templates/{web-ci,linux-wasm-ci}.yml,
@@ -25,6 +30,7 @@ TAG=v1.30.0
 EMSDK_VERSION=4.0.23
 ORT_SRC="${ORT_SRC:?set ORT_SRC to the onnxruntime checkout folder}"
 PATCH="${PATCH:-1}"
+FORCE_DP4A="${FORCE_DP4A:-0}"
 OUT="${OUT:?set OUT to the output dist folder}"
 BUILD_DIR="${BUILD_DIR:-$ORT_SRC/build/wasm_webgpu}"
 
@@ -37,11 +43,23 @@ test "$(git describe --tags --exact-match 2>/dev/null || true)" = "$TAG" || { ec
 
 # Source state: the tag, plus the patch when PATCH=1. Tracked files and new
 # files under onnxruntime/ are reset; the build folder and emsdk stay.
-patch_file="$app/reference/onnxruntime-webgpu.patch"
+patch_file="${PATCH_FILE:-$app/reference/onnxruntime-webgpu.patch}"
 git reset -q
 git checkout -- .
 git clean -fdq -- onnxruntime
 if [ "$PATCH" = 1 ]; then git apply --whitespace=nowarn "$patch_file"; fi
+if [ "$FORCE_DP4A" = 1 ]; then
+  [ "$PATCH" = 1 ] || { echo "FORCE_DP4A=1 needs PATCH=1" >&2; exit 1; }
+  dp4a_src=onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
+  sed -i.bak 's/^#define ORT_FORK_DEBUG_FORCE_DP4A 0$/#define ORT_FORK_DEBUG_FORCE_DP4A 1/' "$dp4a_src" && rm -f "$dp4a_src.bak"
+  grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 1$' "$dp4a_src" || { echo "could not set ORT_FORK_DEBUG_FORCE_DP4A" >&2; exit 1; }
+  echo "DEBUG BUILD: ORT_FORK_DEBUG_FORCE_DP4A=1 (DP4A on every GPU)"
+elif [ "$PATCH" = 1 ]; then
+  # A normal build must not force DP4A. Catches a patch re-exported from a
+  # tree that a FORCE_DP4A=1 build left at 1.
+  grep -q '^#define ORT_FORK_DEBUG_FORCE_DP4A 0$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc || {
+    echo "patch does not set ORT_FORK_DEBUG_FORCE_DP4A 0 (a debug patch?); refusing a normal build" >&2; exit 1; }
+fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
 git reset -q
