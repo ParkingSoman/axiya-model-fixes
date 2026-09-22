@@ -481,10 +481,10 @@ index c0e3b74..a1bf44f 100644
  
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template
 new file mode 100644
-index 0000000..9e31dbe
+index 0000000..c293842
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,138 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -494,16 +494,15 @@ index 0000000..9e31dbe
 +// A is quantized by DP4AMatMulQuantizeProgram first, per row and per
 +// 128-element block, so each row's int8 values do not depend on M.
 +//
-+// Row invariance: a row gets the same bits for every M. One pipeline serves
-+// every M (M is a uniform, not in the cache key), and every row runs the same
-+// instructions: the rows of a row tile are a runtime loop, not unrolled, and
-+// a row's sums never depend on the other rows or on its place in the tile.
-+//
-+// Per row and output column:
-+//   - lane l of k_lanes owns the 32-element K chunks kv = l, l + k_lanes, ...;
-+//   - per chunk: acc_l += SDP8AI(a, b, a1, b1, scale_a * scale_b) (acc_l in
-+//     workgroup memory; the integer dot products are exact);
-+//   - output = 0; output += acc_l for l = 0 .. k_lanes - 1; then + bias.
++// Row invariance: a row gets the same bits for every M.
++//   - One pipeline serves every M (M is a uniform, not in the cache key).
++//   - The rows of a row tile are a runtime loop, so every row runs the same
++//     instructions, and a row's sums never depend on the other rows.
++//   - The summation order of a row is fixed:
++//       lane l of k_lanes owns the 32-element K chunks kv = l, l + k_lanes, ...;
++//       per chunk: acc_l += SDP8AI(a, b, a1, b1, scale_a * scale_b) (the
++//       integer dot products are exact);
++//       output = 0; output += acc_l for l = 0 .. k_lanes - 1; then + bias.
 +//
 +// Speed: one workgroup computes up to tile_rows rows for cols_per_wg columns;
 +// each B chunk is read and converted to int8 once for all rows of the tile.
@@ -516,6 +515,7 @@ index 0000000..9e31dbe
 +#param has_bias
 +#param output_type_i32
 +#param tile_rows
++#param reduce_rows
 +#param cols_per_thread
 +#param col_groups
 +#param k_lanes
@@ -527,8 +527,8 @@ index 0000000..9e31dbe
 +const cols_per_wg = cols_per_thread * col_groups;
 +const wg_threads = col_groups * k_lanes;
 +
-+// Lane sums of every (row, column): [row][column slot][thread].
-+var<workgroup> acc: array<output_element_t, tile_rows * cols_per_thread * wg_threads>;
++// Lane sums for the final reduction: [row][column slot][lane].
++var<workgroup> partials: array<array<output_element_t, k_lanes>, reduce_rows * cols_per_wg>;
 +
 +$MAIN {
 +  let tiles_per_batch = uniforms.num_N_tile * uniforms.num_M_tile;
@@ -540,12 +540,15 @@ index 0000000..9e31dbe
 +  let n_base = (workgroup_idx % uniforms.num_N_tile) * cols_per_wg;
 +  let row0 = m_tile * uniforms.rows_per_tile;
 +  let rows = min(uniforms.rows_per_tile, uniforms.M - row0);
++  // Consecutive threads take consecutive K lanes of one column group.
 +  let lane = local_idx % k_lanes;
 +  let group = local_idx / k_lanes;
 +  let col0 = n_base + group * cols_per_thread;
 +  let K128 = uniforms.K / 128;
 +  let a_base = batch * uniforms.M * uniforms.K16 + row0 * uniforms.K16;
 +  let scale_a_base = batch * uniforms.M * K128 + row0 * K128;
++
++  var acc: array<array<output_element_t, cols_per_thread>, tile_rows>;
 +
 +  for (var k_offset = lane; k_offset < uniforms.K32; k_offset += k_lanes) {
 +    // k_offset covers 32 values of k.
@@ -581,41 +584,56 @@ index 0000000..9e31dbe
 +      let own_scale_a = scales_a.getByOffset(scale_a_base + m * K128 + k_offset / 4);
 +      for (var c = 0u; c < cols_per_thread; c++) {
 +#if has_zero_points && n_bits == 8
-+        acc[(m * cols_per_thread + c) * wg_threads + local_idx] += SDP8AI(own_a, own_bs[c], own_a1, own_b1s[c], own_scale_a * scale_bs[c], zeros[c]);
++        acc[m][c] += SDP8AI(own_a, own_bs[c], own_a1, own_b1s[c], own_scale_a * scale_bs[c], zeros[c]);
 +#else
-+        acc[(m * cols_per_thread + c) * wg_threads + local_idx] += SDP8AI(own_a, own_bs[c], own_a1, own_b1s[c], own_scale_a * scale_bs[c]);
++        acc[m][c] += SDP8AI(own_a, own_bs[c], own_a1, own_b1s[c], own_scale_a * scale_bs[c]);
 +#endif
 +      }
 +    }
 +  }
-+  workgroupBarrier();
 +
-+  // Sum the k_lanes lane sums of every (row, column) in lane order.
-+  for (var t = local_idx; t < rows * cols_per_wg; t += wg_threads) {
-+    let m = t / cols_per_wg;
-+    let slot = t % cols_per_wg;
-+    let col = n_base + slot;
-+    let base = (m * cols_per_thread + slot % cols_per_thread) * wg_threads + (slot / cols_per_thread) * k_lanes;
-+    if (col < uniforms.N) {
-+      var output_value = output_element_t(0);
-+      for (var l = 0u; l < k_lanes; l++) {
-+        output_value += acc[base + l];
++  // Sum the k_lanes lane sums of every (row, column) in lane order,
++  // reduce_rows rows at a time.
++  for (var mb = 0u; mb < tile_rows; mb += reduce_rows) {
++    for (var r = 0u; r < reduce_rows; r++) {
++      if (mb + r < rows) {
++        for (var c = 0u; c < cols_per_thread; c++) {
++          partials[r * cols_per_wg + group * cols_per_thread + c][lane] = acc[mb + r][c];
++        }
 +      }
-+      let output_idx = batch * uniforms.M * uniforms.N + (row0 + m) * uniforms.N + col;
-+#if has_bias
-+      let bias_value = bias[col];
-+      output.setByOffset(output_idx, output_value + bias_value);
-+#else
-+      output.setByOffset(output_idx, output_value);
-+#endif
 +    }
++    workgroupBarrier();
++    for (var t = local_idx; t < reduce_rows * cols_per_wg; t += wg_threads) {
++      let r = t / cols_per_wg;
++      let col = n_base + t % cols_per_wg;
++      if (mb + r < rows && col < uniforms.N) {
++        var output_value = output_element_t(0);
++        for (var l = 0u; l < k_lanes; l++) {
++          output_value += partials[t][l];
++        }
++        let output_idx = batch * uniforms.M * uniforms.N + (row0 + mb + r) * uniforms.N + col;
++#if has_bias
++        let bias_value = bias[col];
++        output.setByOffset(output_idx, output_value + bias_value);
++#else
++        output.setByOffset(output_idx, output_value);
++#endif
++      }
++    }
++    workgroupBarrier();
 +  }
 +}  // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
-index e936833..d035662 100644
+index e936833..9a0a9fc 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
-@@ -5,6 +5,25 @@
+@@ -1,10 +1,20 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <algorithm>
++
+ #include "contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h"
  #include "contrib_ops/webgpu/quantization/matmul_nbits_common.h"
  #include "core/providers/webgpu/shader_helper.h"
  
@@ -626,22 +644,11 @@ index e936833..d035662 100644
 +#define ORT_FORK_DEBUG_FORCE_DP4A 0
 +#endif
 +
-+// K4 DP4A kernel shape (batched-int4 fork, 1-16 rows): most rows per row tile,
-+// output columns per thread, and thread groups per workgroup (32 lanes each).
-+#ifndef ORT_FORK_K4_MAX_ROWS_PER_TILE
-+#define ORT_FORK_K4_MAX_ROWS_PER_TILE 8
-+#endif
-+#ifndef ORT_FORK_K4_DP4A_COLS_PER_THREAD
-+#define ORT_FORK_K4_DP4A_COLS_PER_THREAD 2
-+#endif
-+#ifndef ORT_FORK_K4_DP4A_COL_GROUPS
-+#define ORT_FORK_K4_DP4A_COL_GROUPS 4
-+#endif
 +
  namespace onnxruntime {
  namespace contrib {
  namespace webgpu {
-@@ -90,6 +109,99 @@ Status DP4AMatMulNBitsSmallMProgram::GenerateShaderCode(ShaderHelper& shader) co
+@@ -90,6 +100,104 @@ Status DP4AMatMulNBitsSmallMProgram::GenerateShaderCode(ShaderHelper& shader) co
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -667,6 +674,7 @@ index e936833..d035662 100644
 +                             WGSL_TEMPLATE_PARAMETER(k_lanes, k_lanes_),
 +                             WGSL_TEMPLATE_PARAMETER(n_bits, nbits_),
 +                             WGSL_TEMPLATE_PARAMETER(output_type_i32, true),
++                             WGSL_TEMPLATE_PARAMETER(reduce_rows, reduce_rows_),
 +                             WGSL_TEMPLATE_PARAMETER(tile_rows, tile_rows_),
 +                             WGSL_TEMPLATE_VARIABLE(a, a),
 +                             WGSL_TEMPLATE_VARIABLE(b, b),
@@ -706,20 +714,24 @@ index e936833..d035662 100644
 +      .AddUniformVariable({batch_count * M * K / kU32Components});
 +  ORT_RETURN_IF_ERROR(context.RunProgram(quantize_program));
 +
++  // Kernel shape: 32 K lanes and 4 column groups (128 threads), 4 output
++  // columns per thread.
 +  constexpr uint32_t k_lanes = 32;
-+  constexpr uint32_t col_groups = ORT_FORK_K4_DP4A_COL_GROUPS;
-+  constexpr uint32_t cols_per_thread = ORT_FORK_K4_DP4A_COLS_PER_THREAD;
++  constexpr uint32_t col_groups = 4;
++  constexpr uint32_t cols_per_thread = 4;
 +  constexpr uint32_t cols_per_wg = cols_per_thread * col_groups;
-+  constexpr uint32_t tile_rows = ORT_FORK_K4_MAX_ROWS_PER_TILE;
-+  static_assert(tile_rows * cols_per_thread * col_groups * k_lanes * 4 <= 16384, "lane sums must fit 16 KB");
-+  // Row tiles of equal size (9 rows: 5 + 4). M and the tile size are
-+  // uniforms, so every M uses the same pipeline.
++  constexpr uint32_t tile_rows = kBatchedMaxRowsPerTile;
++  // Lane sums for the final reduction in workgroup memory: at most 8 KB.
++  constexpr uint32_t reduce_rows = std::max(1u, std::min(tile_rows, 8192u / (cols_per_wg * k_lanes * 4u)));
++  // Row tiles of equal size (one tile for M <= kBatchedMaxRowsPerTile). M
++  // and the tile size are uniforms, so every M uses the same pipeline.
 +  const uint32_t num_M_tile = (M + tile_rows - 1) / tile_rows;
 +  const uint32_t rows_per_tile = (M + num_M_tile - 1) / num_M_tile;
 +  const uint32_t num_N_tile = (N + cols_per_wg - 1) / cols_per_wg;
 +  const bool has_zero_points = zero_points != nullptr;
 +  const bool has_bias = bias != nullptr;
-+  DP4AMatMulNBitsBatchedProgram program{tile_rows, cols_per_thread, col_groups, k_lanes, nbits, has_zero_points, has_bias};
++  DP4AMatMulNBitsBatchedProgram program{tile_rows, reduce_rows, cols_per_thread, col_groups, k_lanes, nbits,
++                                        has_zero_points, has_bias};
 +  program.SetWorkgroupSize(col_groups * k_lanes);
 +  program.SetDispatchGroupSize(batch_count * num_M_tile * num_N_tile);
 +  program.AddInputs({{&a_quant, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components)},
@@ -728,7 +740,7 @@ index e936833..d035662 100644
 +                     {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
 +      .AddUniformVariables({batch_count, M, N, K, K / 16, K / 32, block_size, num_N_tile, num_M_tile, rows_per_tile, zero_blocks_per_col})
 +      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, 1})
-+      .CacheHint(nbits, tile_rows, cols_per_thread, col_groups, has_zero_points, has_bias);
++      .CacheHint(nbits, tile_rows, cols_per_thread, col_groups, k_lanes, has_zero_points, has_bias);
 +  if (has_zero_points) {
 +    program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
 +  }
@@ -741,7 +753,7 @@ index e936833..d035662 100644
  Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
-@@ -207,7 +319,7 @@ bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
+@@ -207,7 +315,7 @@ bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
    // https://github.com/gpuweb/gpuweb/issues/2677#issuecomment-1713292226
    // Use 'vendor' to check for metal; 'backend' is always WEBGPU when running under wasm.
    bool use_dp4a = context.HasFeature(wgpu::FeatureName::Subgroups) &&
@@ -751,23 +763,36 @@ index e936833..d035662 100644
          components_k == 4 && K % 128 == 0 && N % 16 == 0 &&
          use_dp4a)) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-index 49b51d3..417ccac 100644
+index 49b51d3..e317808 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-@@ -97,6 +97,62 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
+@@ -14,6 +14,12 @@ namespace webgpu {
+ 
+ using namespace onnxruntime::webgpu;
+ 
++// Batched-int4 fork (K4): MatMulNBits for 1 <= M <= 16 rows runs through
++// MatMulNBitsBatchedProgram (float path) or DP4AMatMulNBitsBatchedProgram
++// (DP4A path), with row tiles of at most this many rows. One tile of 16 rows
++// was faster than two launches of up to 8 rows on the Apple M5.
++inline constexpr uint32_t kBatchedMaxRowsPerTile = 16;
++
+ class DP4AMatMulQuantizeProgram final : public Program<DP4AMatMulQuantizeProgram> {
+  public:
+   DP4AMatMulQuantizeProgram() : Program{"DP4AMatMulQuantize"} {}
+@@ -97,6 +103,63 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
    bool broadcast_a_row_;
  };
  
 +// DP4A program for 1 <= M <= 16 rows (batched-int4 fork): one pipeline for
-+// every M, the rows of a row tile in a runtime loop, so a row gets the same
-+// bits for every M; each B chunk is read once per row tile. See
-+// dp4a_matmul_batched.wgsl.template.
++// every M, so a row gets the same bits for every M; each B chunk is read once
++// per row tile. See dp4a_matmul_batched.wgsl.template.
 +class DP4AMatMulNBitsBatchedProgram final : public Program<DP4AMatMulNBitsBatchedProgram> {
 + public:
-+  DP4AMatMulNBitsBatchedProgram(uint32_t tile_rows, uint32_t cols_per_thread, uint32_t col_groups,
-+                                uint32_t k_lanes, uint32_t nbits, bool has_zero_points, bool has_bias)
++  DP4AMatMulNBitsBatchedProgram(uint32_t tile_rows, uint32_t reduce_rows, uint32_t cols_per_thread,
++                                uint32_t col_groups, uint32_t k_lanes, uint32_t nbits, bool has_zero_points, bool has_bias)
 +      : Program{"DP4AMatMulNBitsBatched"},
 +        tile_rows_(tile_rows),
++        reduce_rows_(reduce_rows),
 +        cols_per_thread_(cols_per_thread),
 +        col_groups_(col_groups),
 +        k_lanes_(k_lanes),
@@ -790,6 +815,7 @@ index 49b51d3..417ccac 100644
 +
 + private:
 +  uint32_t tile_rows_;
++  uint32_t reduce_rows_;
 +  uint32_t cols_per_thread_;
 +  uint32_t col_groups_;
 +  uint32_t k_lanes_;
@@ -818,30 +844,26 @@ index 49b51d3..417ccac 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..8d18d67 100644
+index 45baa67..ebb010f 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-@@ -14,6 +14,19 @@
+@@ -1,6 +1,7 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#include <algorithm>
+ #include <string>
+ #include <string_view>
+ 
+@@ -14,6 +15,7 @@
  #include "core/providers/webgpu/webgpu_supported_types.h"
  #include "core/providers/webgpu/webgpu_utils.h"
  
-+// K4 float kernel shape (batched-int4 fork, 1-16 rows): threads per
-+// workgroup, output columns per thread, and most rows per row tile (see also
-+// dp4a_matmul_nbits.cc).
-+#ifndef ORT_FORK_K4_FLOAT_THREADS
-+#define ORT_FORK_K4_FLOAT_THREADS 128
-+#endif
-+#ifndef ORT_FORK_K4_FLOAT_COLS_PER_THREAD
-+#define ORT_FORK_K4_FLOAT_COLS_PER_THREAD 2
-+#endif
-+#ifndef ORT_FORK_K4_MAX_ROWS_PER_TILE
-+#define ORT_FORK_K4_MAX_ROWS_PER_TILE 8
-+#endif
 +
  namespace onnxruntime {
  namespace contrib {
  namespace webgpu {
-@@ -112,6 +125,37 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -112,6 +114,36 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -857,18 +879,17 @@ index 45baa67..8d18d67 100644
 +  }
 +  const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
 +  ORT_ENFORCE(a.NumComponents() == 4, "MatMulNBitsBatched needs K % 4 == 0.");
-+  ORT_ENFORCE(component_b_ == 2 || component_b_ == 4, "MatMulNBitsBatched needs 2 or 4 words per B value.");
 +  ORT_ENFORCE(WorkgroupSizeX() == col_groups_ * k_lanes_, "workgroup size must be col_groups * k_lanes.");
 +
 +  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_batched.wgsl.template",
 +                             WGSL_TEMPLATE_PARAMETER(col_groups, col_groups_),
 +                             WGSL_TEMPLATE_PARAMETER(cols_per_thread, cols_per_thread_),
-+                             WGSL_TEMPLATE_PARAMETER(component_b, component_b_),
 +                             WGSL_TEMPLATE_PARAMETER(has_bias, has_bias_),
 +                             WGSL_TEMPLATE_PARAMETER(has_zero_points, has_zero_points_),
 +                             WGSL_TEMPLATE_PARAMETER(k_lanes, k_lanes_),
 +                             WGSL_TEMPLATE_PARAMETER(n_bits, nbits_),
 +                             WGSL_TEMPLATE_PARAMETER(output_type_i32, false),
++                             WGSL_TEMPLATE_PARAMETER(reduce_rows, reduce_rows_),
 +                             WGSL_TEMPLATE_PARAMETER(tile_rows, tile_rows_),
 +                             WGSL_TEMPLATE_VARIABLE(a, a),
 +                             WGSL_TEMPLATE_VARIABLE(b, b),
@@ -879,7 +900,7 @@ index 45baa67..8d18d67 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +266,93 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,9 +254,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -891,7 +912,7 @@ index 45baa67..8d18d67 100644
 +  // instructions whatever M is. (Two different kernels would not do: Metal
 +  // compiles WebGPU shaders in relaxed math mode, which may reassociate float
 +  // sums differently in each kernel.) The batched programs read each weight
-+  // once per tile of up to ORT_FORK_K4_MAX_ROWS_PER_TILE rows.
++  // once per tile of up to kBatchedMaxRowsPerTile rows.
 +  constexpr uint32_t kMinBatchedM = 2;
 +  constexpr uint32_t kMaxBatchedM = 16;
 +  const bool small_m = M >= kMinBatchedM && M <= kMaxBatchedM;
@@ -915,38 +936,40 @@ index 45baa67..8d18d67 100644
 +
 +  // The float path: B dequantized to the activation type (float32 or
 +  // float16), dot products in that type.
++  const uint32_t elements_per_word = 32 / static_cast<uint32_t>(nbits);
 +  if (batchable && (nbits == 4 || nbits == 8) && components_a == 4 &&
-+      (components_b == 2 || components_b == 4) &&
-+      // Each B value must lie in one quantization block, and A rows are only K
++      // A B word must lie in one quantization block, and A rows are only K
 +      // long: the kernel walks the block-padded K of B.
-+      block_size % (components_b * 32 / static_cast<uint32_t>(nbits)) == 0 &&
-+      K % block_size == 0) {
-+    // Lanes per column as in MatMulNBitsProgram (tile_size_k_vec).
-+    const uint32_t k_lanes = (context.AdapterInfo().vendor == std::string_view{"intel"}) ? 16u : 32u;
-+    const uint32_t col_groups = ORT_FORK_K4_FLOAT_THREADS / k_lanes;
-+    constexpr uint32_t cols_per_thread = ORT_FORK_K4_FLOAT_COLS_PER_THREAD;
-+    const uint32_t cols_per_wg = cols_per_thread * col_groups;
-+    constexpr uint32_t tile_rows = ORT_FORK_K4_MAX_ROWS_PER_TILE;
-+    static_assert(tile_rows * cols_per_thread * ORT_FORK_K4_FLOAT_THREADS * 4 <= 16384, "lane sums must fit 16 KB");
-+    // Row tiles of equal size (9 rows: 5 + 4). M and the tile size are
-+    // uniforms, so every M uses the same pipeline.
++      block_size % elements_per_word == 0 && K % block_size == 0) {
++    // Kernel shape: 32 K lanes and 4 column groups (128 threads), 4 output
++    // columns per thread (2 columns per thread took twice as long on the M5).
++    constexpr uint32_t k_lanes = 32;
++    constexpr uint32_t col_groups = 4;
++    constexpr uint32_t cols_per_thread = 4;
++    constexpr uint32_t cols_per_wg = cols_per_thread * col_groups;
++    constexpr uint32_t tile_rows = kBatchedMaxRowsPerTile;
++    const uint32_t element_bytes = y->DataType() == DataTypeImpl::GetType<MLFloat16>() ? 2u : 4u;
++    // Lane sums for the final reduction in workgroup memory: at most 8 KB.
++    const uint32_t reduce_rows = std::max(1u, std::min(tile_rows, 8192u / (cols_per_wg * k_lanes * element_bytes)));
++    // Row tiles of equal size (one tile for M <= kBatchedMaxRowsPerTile). M
++    // and the tile size are uniforms, so every M uses the same pipeline.
 +    const uint32_t num_M_tile = CeilDiv(M, tile_rows);
 +    const uint32_t rows_per_tile = CeilDiv(M, num_M_tile);
 +    const uint32_t num_N_tile = CeilDiv(N, cols_per_wg);
-+    const uint32_t K_of_b = (n_blocks_per_col * blob_size) / (components_b * 4);
-+    MatMulNBitsBatchedProgram program{tile_rows, cols_per_thread, col_groups, k_lanes, components_b,
-+                                      static_cast<uint32_t>(nbits), has_zero_points, has_bias};
++    const uint32_t words = (n_blocks_per_col * blob_size) / 4;
++    MatMulNBitsBatchedProgram program{tile_rows, reduce_rows, cols_per_thread, col_groups,
++                                      k_lanes, static_cast<uint32_t>(nbits), has_zero_points, has_bias};
 +    program.SetWorkgroupSize(col_groups * k_lanes);
 +    program.SetDispatchGroupSize(num_N_tile * num_M_tile * batch_count);
 +    program
 +        .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 4},
-+                    {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(components_b * 4)},
++                    {b, ProgramTensorMetadataDependency::TypeAndRank, 4},
 +                    {scales, ProgramTensorMetadataDependency::TypeAndRank}})
 +        .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank})
 +        .AddUniformVariables({{M},
 +                              {N},
 +                              {K / 4},
-+                              {K_of_b},
++                              {words},
 +                              {block_size},
 +                              {n_blocks_per_col},
 +                              {zero_blocks_per_col},
@@ -954,7 +977,7 @@ index 45baa67..8d18d67 100644
 +                              {num_M_tile},
 +                              {rows_per_tile},
 +                              {batch_count}})
-+        .CacheHint(nbits, components_b, has_zero_points, has_bias, tile_rows, cols_per_thread, k_lanes);
++        .CacheHint(nbits, has_zero_points, has_bias, tile_rows, reduce_rows, cols_per_thread, col_groups, k_lanes);
 +    if (has_zero_points) {
 +      program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
 +    }
@@ -974,7 +997,7 @@ index 45baa67..8d18d67 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +368,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +358,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -993,7 +1016,7 @@ index 45baa67..8d18d67 100644
                                                                   block_size,
                                                                   nbits,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
-index bf56d4f..5897ae1 100644
+index bf56d4f..ef71563 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
 @@ -71,6 +71,48 @@ class MatMulNBitsProgram final : public Program<MatMulNBitsProgram> {
@@ -1001,19 +1024,19 @@ index bf56d4f..5897ae1 100644
  };
  
 +// Program for 1 <= M <= 16 rows on the float path (batched-int4 fork): one
-+// pipeline for every M, the rows of a row tile in a runtime loop, so a row
-+// gets the same bits for every M; each B value is read and dequantized once
-+// per row tile. See matmul_nbits_batched.wgsl.template.
++// pipeline for every M, so a row gets the same bits for every M; each B word
++// is read and dequantized once per row tile. See
++// matmul_nbits_batched.wgsl.template.
 +class MatMulNBitsBatchedProgram final : public Program<MatMulNBitsBatchedProgram> {
 + public:
-+  MatMulNBitsBatchedProgram(uint32_t tile_rows, uint32_t cols_per_thread, uint32_t col_groups, uint32_t k_lanes,
-+                            uint32_t component_b, uint32_t nbits, bool has_zero_points, bool has_bias)
++  MatMulNBitsBatchedProgram(uint32_t tile_rows, uint32_t reduce_rows, uint32_t cols_per_thread,
++                            uint32_t col_groups, uint32_t k_lanes, uint32_t nbits, bool has_zero_points, bool has_bias)
 +      : Program{"MatMulNBitsBatched"},
 +        tile_rows_(tile_rows),
++        reduce_rows_(reduce_rows),
 +        cols_per_thread_(cols_per_thread),
 +        col_groups_(col_groups),
 +        k_lanes_(k_lanes),
-+        component_b_(component_b),
 +        nbits_(nbits),
 +        has_zero_points_(has_zero_points),
 +        has_bias_(has_bias) {}
@@ -1022,7 +1045,7 @@ index bf56d4f..5897ae1 100644
 +      {"M", ProgramUniformVariableDataType::Uint32},
 +      {"N", ProgramUniformVariableDataType::Uint32},
 +      {"K_of_a", ProgramUniformVariableDataType::Uint32},
-+      {"K_of_b", ProgramUniformVariableDataType::Uint32},
++      {"words", ProgramUniformVariableDataType::Uint32},
 +      {"block_size", ProgramUniformVariableDataType::Uint32},
 +      {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
 +      {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32},
@@ -1033,10 +1056,10 @@ index bf56d4f..5897ae1 100644
 +
 + private:
 +  uint32_t tile_rows_;
++  uint32_t reduce_rows_;
 +  uint32_t cols_per_thread_;
 +  uint32_t col_groups_;
 +  uint32_t k_lanes_;
-+  uint32_t component_b_;
 +  uint32_t nbits_;
 +  bool has_zero_points_;
 +  bool has_bias_;
@@ -1047,7 +1070,7 @@ index bf56d4f..5897ae1 100644
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
-index 0000000..9ad9cdf
+index 0000000..b403600
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 @@ -0,0 +1,140 @@
@@ -1058,33 +1081,31 @@ index 0000000..9ad9cdf
 +// activation type, float32 or float16): one-token decode steps (M = 1) and
 +// short multi-token passes such as a speculative verify pass (M = 2..16).
 +//
-+// Row invariance: a row gets the same bits for every M. One pipeline serves
-+// every M (M is a uniform, not in the cache key), and every row runs the same
-+// instructions: the rows of a row tile are a runtime loop, not unrolled, and
-+// a row's sums never depend on the other rows or on its place in the tile.
-+// (Metal compiles WebGPU shaders in relaxed math mode, which may reassociate
-+// float sums, so two different kernels or two unrolled copies of the same
-+// expression need not give the same bits.)
-+//
-+// Per row and output column:
-+//   - lane l of k_lanes owns the B values (one vec<u32> of component_b words)
-+//     kv = l, l + k_lanes, ...;
-+//   - per B value: sum = 0; for each word i: sum += dot(a0, b0) + dot(a1, b1);
-+//     then acc_l += sum (acc_l in workgroup memory);
-+//   - output = 0; output += acc_l for l = 0 .. k_lanes - 1; output += bias.
++// Row invariance: a row gets the same bits for every M.
++//   - One pipeline serves every M (M is a uniform, not in the cache key).
++//   - The rows of a row tile are a runtime loop, so every row runs the same
++//     instructions, and a row's sums never depend on the other rows.
++//     (Metal compiles WebGPU shaders in relaxed math mode, which may
++//     reassociate float sums; two different kernels, or two unrolled copies of
++//     one expression, need not give the same bits.)
++//   - The summation order of a row is fixed:
++//       lane l of k_lanes owns the B words w = l, l + k_lanes, ...;
++//       per word: acc_l += dot(a0, b0) + dot(a1, b1) (4 bits) or dot(a0, b)
++//       (8 bits);
++//       output = 0; output += acc_l for l = 0 .. k_lanes - 1; output += bias.
 +//
 +// Speed: one workgroup computes up to tile_rows rows for cols_per_wg columns;
-+// each B value is read and dequantized once for all rows of the tile.
++// each B word is read and dequantized once for all rows of the tile.
 +//
 +// Requirements (checked on the host): A has 4 components (K % 4 == 0), K is a
-+// multiple of block_size, component_b is 2 or 4, n_bits is 4 or 8.
++// multiple of block_size, block_size a multiple of 32 / n_bits, n_bits 4 or 8.
 +
 +#param n_bits
-+#param component_b
 +#param has_zero_points
 +#param has_bias
 +#param output_type_i32
 +#param tile_rows
++#param reduce_rows
 +#param cols_per_thread
 +#param col_groups
 +#param k_lanes
@@ -1096,12 +1117,9 @@ index 0000000..9ad9cdf
 +const cols_per_wg = cols_per_thread * col_groups;
 +const wg_threads = col_groups * k_lanes;
 +const elements_per_word = 32u / n_bits;
-+const elements_in_value_b = component_b * elements_per_word;
-+// vec4 values of A per B word: 2 for 4 bits (8 elements), 1 for 8 bits.
-+const a_vec_per_word = elements_per_word / 4u;
 +
-+// Lane sums of every (row, column): [row][column slot][thread].
-+var<workgroup> acc: array<output_element_t, tile_rows * cols_per_thread * wg_threads>;
++// Lane sums for the final reduction: [row][column slot][lane].
++var<workgroup> partials: array<array<output_element_t, k_lanes>, reduce_rows * cols_per_wg>;
 +
 +$MAIN {
 +  // A dispatch above 65535 workgroups is split into a 2-D grid that can hold
@@ -1115,80 +1133,85 @@ index 0000000..9ad9cdf
 +  let n_base = (workgroup_idx % uniforms.num_N_tile) * cols_per_wg;
 +  let row0 = m_tile * uniforms.rows_per_tile;
 +  let rows = min(uniforms.rows_per_tile, uniforms.M - row0);
++  // Consecutive threads take consecutive K lanes of one column group, so they
++  // read consecutive B words and consecutive A values.
 +  let lane = local_idx % k_lanes;
 +  let group = local_idx / k_lanes;
 +  let col0 = n_base + group * cols_per_thread;
 +  let a_base = batch * uniforms.M * uniforms.K_of_a + row0 * uniforms.K_of_a;
 +
-+  for (var kv = lane; kv < uniforms.K_of_b; kv += k_lanes) {
-+    let block_idx = (kv * elements_in_value_b) / uniforms.block_size;
++  var acc: array<array<output_element_t, cols_per_thread>, tile_rows>;
++
++  for (var w = lane; w < uniforms.words; w += k_lanes) {
++    let block_idx = (w * elements_per_word) / uniforms.block_size;
 +#if n_bits == 4
-+    var b0s: array<array<vec4<output_element_t>, cols_per_thread>, component_b>;
-+    var b1s: array<array<vec4<output_element_t>, cols_per_thread>, component_b>;
-+#else
-+    var bus: array<array<vec4<output_element_t>, cols_per_thread>, component_b>;
-+#endif
++    // Word w holds k = 8w .. 8w+7: element 2j in the low nibble of byte j.
++    var b_lo: array<vec4<output_element_t>, cols_per_thread>;
++    var b_hi: array<vec4<output_element_t>, cols_per_thread>;
 +    for (var c = 0u; c < cols_per_thread; c++) {
 +      let col = min(col0 + c, uniforms.N - 1);
-+      let scale_b = scales_b.getByOffset(col * uniforms.blocks_per_col + block_idx);
++      let q = b.getByOffset(col * uniforms.words + w);
++      let scale = scales_b.getByOffset(col * uniforms.blocks_per_col + block_idx);
 +      let zero = mm_read_zero(col, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
-+#if component_b == 4
-+      let b_value = b.getByOffset(col * uniforms.K_of_b + kv);
-+#else
-+      let b_value = vec4<u32>(b.getByOffset(col * uniforms.K_of_b + kv), 0u, 0u);
-+#endif
-+      for (var i = 0u; i < component_b; i++) {
-+#if n_bits == 4
-+        let b_value_lower = vec4<output_element_t>(unpack4xU8(b_value[i] & 0x0F0F0F0Fu)) - vec4<output_element_t>(zero);
-+        let b_value_upper = vec4<output_element_t>(unpack4xU8((b_value[i] >> 4) & 0x0F0F0F0Fu)) - vec4<output_element_t>(zero);
-+        b0s[i][c] = vec4<output_element_t>(b_value_lower[0], b_value_upper[0], b_value_lower[1], b_value_upper[1]) * scale_b;
-+        b1s[i][c] = vec4<output_element_t>(b_value_lower[2], b_value_upper[2], b_value_lower[3], b_value_upper[3]) * scale_b;
-+#else
-+        bus[i][c] = (vec4<output_element_t>(unpack4xU8(b_value[i])) - vec4<output_element_t>(zero)) * scale_b;
-+#endif
-+      }
++      let lower = vec4<output_element_t>(unpack4xU8(q & 0x0F0F0F0Fu)) - vec4<output_element_t>(zero);
++      let upper = vec4<output_element_t>(unpack4xU8((q >> 4) & 0x0F0F0F0Fu)) - vec4<output_element_t>(zero);
++      b_lo[c] = vec4<output_element_t>(lower[0], upper[0], lower[1], upper[1]) * scale;
++      b_hi[c] = vec4<output_element_t>(lower[2], upper[2], lower[3], upper[3]) * scale;
 +    }
++#else
++    // Word w holds k = 4w .. 4w+3, one byte each.
++    var bv: array<vec4<output_element_t>, cols_per_thread>;
++    for (var c = 0u; c < cols_per_thread; c++) {
++      let col = min(col0 + c, uniforms.N - 1);
++      let q = b.getByOffset(col * uniforms.words + w);
++      let scale = scales_b.getByOffset(col * uniforms.blocks_per_col + block_idx);
++      let zero = mm_read_zero(col, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
++      bv[c] = (vec4<output_element_t>(unpack4xU8(q)) - vec4<output_element_t>(zero)) * scale;
++    }
++#endif
 +    // Runtime loop over the rows of the tile: the same instructions for every row.
 +    for (var m = 0u; m < rows; m++) {
-+      let a_offset = a_base + m * uniforms.K_of_a + kv * component_b * a_vec_per_word;
-+      var sums: array<output_element_t, cols_per_thread>;
-+      for (var i = 0u; i < component_b; i++) {
 +#if n_bits == 4
-+        let a0 = a.getByOffset(a_offset + 2 * i);
-+        let a1 = a.getByOffset(a_offset + 2 * i + 1);
-+        for (var c = 0u; c < cols_per_thread; c++) {
-+          sums[c] += dot(a0, b0s[i][c]) + dot(a1, b1s[i][c]);
-+        }
-+#else
-+        let a0 = a.getByOffset(a_offset + i);
-+        for (var c = 0u; c < cols_per_thread; c++) {
-+          sums[c] += dot(a0, bus[i][c]);
-+        }
-+#endif
-+      }
++      let a0 = a.getByOffset(a_base + m * uniforms.K_of_a + 2 * w);
++      let a1 = a.getByOffset(a_base + m * uniforms.K_of_a + 2 * w + 1);
 +      for (var c = 0u; c < cols_per_thread; c++) {
-+        acc[(m * cols_per_thread + c) * wg_threads + local_idx] += sums[c];
++        acc[m][c] += dot(a0, b_lo[c]) + dot(a1, b_hi[c]);
 +      }
++#else
++      let a0 = a.getByOffset(a_base + m * uniforms.K_of_a + w);
++      for (var c = 0u; c < cols_per_thread; c++) {
++        acc[m][c] += dot(a0, bv[c]);
++      }
++#endif
 +    }
 +  }
-+  workgroupBarrier();
 +
-+  // Sum the k_lanes lane sums of every (row, column) in lane order.
-+  for (var t = local_idx; t < rows * cols_per_wg; t += wg_threads) {
-+    let m = t / cols_per_wg;
-+    let slot = t % cols_per_wg;
-+    let col = n_base + slot;
-+    let base = (m * cols_per_thread + slot % cols_per_thread) * wg_threads + (slot / cols_per_thread) * k_lanes;
-+    if (col < uniforms.N) {
-+      var output_value = output_element_t(0);
-+      for (var l = 0u; l < k_lanes; l++) {
-+        output_value += acc[base + l];
++  // Sum the k_lanes lane sums of every (row, column) in lane order,
++  // reduce_rows rows at a time.
++  for (var mb = 0u; mb < tile_rows; mb += reduce_rows) {
++    for (var r = 0u; r < reduce_rows; r++) {
++      if (mb + r < rows) {
++        for (var c = 0u; c < cols_per_thread; c++) {
++          partials[r * cols_per_wg + group * cols_per_thread + c][lane] = acc[mb + r][c];
++        }
 +      }
-+#if has_bias
-+      output_value += bias[col];
-+#endif
-+      output.setByOffset(batch * uniforms.M * uniforms.N + (row0 + m) * uniforms.N + col, output_value);
 +    }
++    workgroupBarrier();
++    for (var t = local_idx; t < reduce_rows * cols_per_wg; t += wg_threads) {
++      let r = t / cols_per_wg;
++      let col = n_base + t % cols_per_wg;
++      if (mb + r < rows && col < uniforms.N) {
++        var output_value = output_element_t(0);
++        for (var l = 0u; l < k_lanes; l++) {
++          output_value += partials[t][l];
++        }
++#if has_bias
++        output_value += bias[col];
++#endif
++        output.setByOffset(batch * uniforms.M * uniforms.N + (row0 + mb + r) * uniforms.N + col, output_value);
++      }
++    }
++    workgroupBarrier();
 +  }
 +}  // MAIN
 diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
