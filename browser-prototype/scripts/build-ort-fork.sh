@@ -14,8 +14,11 @@
 #   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
 #     activations) where one-token steps use DP4A, else float (float32 or
 #     float16), with the rows in a runtime loop; each weight is read once per
-#     tile of up to 8 rows. One-token steps use it too. Other 2-16-row cases
+#     tile of up to 16 rows. One-token steps use it too. Other 2-16-row cases
 #     run the one-row float program per row, never the prefill tile kernels.
+#   - Fused MatMulNBitsMlp/Qkv one-token decode programs: switch
+#     ORT_FORK_FUSED_DECODE in dp4a_matmul_nbits.h (K4 fix 1; 0 = one-token
+#     steps take the same unfused path as 2-16-row passes).
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -93,6 +96,9 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'if (!small_m && CanApplySubgroupMatrixMatMulNBits' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'use_wide_tile_program = !small_m &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'DP4AMatMulNBitsBatchedProgram' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
+    grep -q '^#define ORT_FORK_FUSED_DECODE [01]$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
+    grep -q 'ORT_FORK_FUSED_DECODE != 0 &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc &&
+    grep -q 'M != 1 || ORT_FORK_FUSED_DECODE == 0' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc &&
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
       echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }

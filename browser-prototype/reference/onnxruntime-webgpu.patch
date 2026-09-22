@@ -624,10 +624,10 @@ index 0000000..c293842
 +  }
 +}  // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
-index e936833..9a0a9fc 100644
+index e936833..24738bc 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
-@@ -1,10 +1,20 @@
+@@ -1,10 +1,19 @@
  // Copyright (c) Microsoft Corporation. All rights reserved.
  // Licensed under the MIT License.
  
@@ -644,11 +644,10 @@ index e936833..9a0a9fc 100644
 +#define ORT_FORK_DEBUG_FORCE_DP4A 0
 +#endif
 +
-+
  namespace onnxruntime {
  namespace contrib {
  namespace webgpu {
-@@ -90,6 +100,104 @@ Status DP4AMatMulNBitsSmallMProgram::GenerateShaderCode(ShaderHelper& shader) co
+@@ -90,6 +99,104 @@ Status DP4AMatMulNBitsSmallMProgram::GenerateShaderCode(ShaderHelper& shader) co
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -753,7 +752,7 @@ index e936833..9a0a9fc 100644
  Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
-@@ -207,7 +315,7 @@ bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
+@@ -207,7 +314,7 @@ bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
    // https://github.com/gpuweb/gpuweb/issues/2677#issuecomment-1713292226
    // Use 'vendor' to check for metal; 'backend' is always WEBGPU when running under wasm.
    bool use_dp4a = context.HasFeature(wgpu::FeatureName::Subgroups) &&
@@ -763,10 +762,10 @@ index e936833..9a0a9fc 100644
          components_k == 4 && K % 128 == 0 && N % 16 == 0 &&
          use_dp4a)) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-index 49b51d3..e317808 100644
+index 49b51d3..f5abb9e 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h
-@@ -14,6 +14,12 @@ namespace webgpu {
+@@ -14,6 +14,21 @@ namespace webgpu {
  
  using namespace onnxruntime::webgpu;
  
@@ -776,10 +775,19 @@ index 49b51d3..e317808 100644
 +// was faster than two launches of up to 8 rows on the Apple M5.
 +inline constexpr uint32_t kBatchedMaxRowsPerTile = 16;
 +
++// Batched-int4 fork: 1 = one-token steps (M = 1) may use the fused
++// MatMulNBitsMlpDecode / MatMulNBitsQkvDecode programs (stock behaviour).
++// 0 = they take the same unfused path as 2-16-row passes (norm program, then
++// MatMulNBits), so a one-token step and a row of a k-token pass run the same
++// kernels and give the same bits.
++#ifndef ORT_FORK_FUSED_DECODE
++#define ORT_FORK_FUSED_DECODE 0
++#endif
++
  class DP4AMatMulQuantizeProgram final : public Program<DP4AMatMulQuantizeProgram> {
   public:
    DP4AMatMulQuantizeProgram() : Program{"DP4AMatMulQuantize"} {}
-@@ -97,6 +103,63 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
+@@ -97,6 +112,63 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
    bool broadcast_a_row_;
  };
  
@@ -844,7 +852,7 @@ index 49b51d3..e317808 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..ebb010f 100644
+index 45baa67..30dfdd8 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -1,6 +1,7 @@
@@ -855,15 +863,7 @@ index 45baa67..ebb010f 100644
  #include <string>
  #include <string_view>
  
-@@ -14,6 +15,7 @@
- #include "core/providers/webgpu/webgpu_supported_types.h"
- #include "core/providers/webgpu/webgpu_utils.h"
- 
-+
- namespace onnxruntime {
- namespace contrib {
- namespace webgpu {
-@@ -112,6 +114,36 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -112,6 +113,36 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -900,7 +900,7 @@ index 45baa67..ebb010f 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +254,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,9 +253,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -997,7 +997,7 @@ index 45baa67..ebb010f 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +358,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +357,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -1214,6 +1214,31 @@ index 0000000..b403600
 +    workgroupBarrier();
 +  }
 +}  // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+index ccb5454..f7a6663 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
+@@ -292,6 +292,7 @@ Status MatMulNBitsMlp::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+   const bool has_skip_output = input_skip_bias_sum != nullptr;
+ 
+   const bool is_decode_fast_path_candidate =
++      ORT_FORK_FUSED_DECODE != 0 &&  // batched-int4 fork, see dp4a_matmul_nbits.h
+       M == 1 &&
+       bits_ == kFusedDecodeFastPathBits &&
+       block_size == kFusedDecodeFastPathBlockSize;
+diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
+index 4d88d37..c154569 100644
+--- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
++++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc
+@@ -234,7 +234,7 @@ Status MatMulNBitsQkv::ComputeInternal(onnxruntime::webgpu::ComputeContext& cont
+       required_storage_buffers > context.DeviceLimits().maxStorageBuffersPerShaderStage;
+ 
+   if (would_use_subgroup_unfused || would_use_dp4a_unfused || would_use_wide_tile_unfused ||
+-      M != 1) {
++      M != 1 || ORT_FORK_FUSED_DECODE == 0) {  // batched-int4 fork, see dp4a_matmul_nbits.h
+     Tensor normalized_a = context.CreateGPUTensor(a->DataType(), a->Shape());
+ 
+     if (skip != nullptr) {
 diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
 index b303182..85903e3 100644
 --- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
