@@ -10,7 +10,7 @@ index e936833..aead61a 100644
 +// too, so a Mac runs the MatMulNBits arithmetic that Intel, AMD and NVIDIA
 +// GPUs run. Set by build-ort-fork.sh FORCE_DP4A=1; never set in a shipped build.
 +#ifndef ORT_FORK_DEBUG_FORCE_DP4A
-+#define ORT_FORK_DEBUG_FORCE_DP4A 1
++#define ORT_FORK_DEBUG_FORCE_DP4A 0
 +#endif
 +
  namespace onnxruntime {
