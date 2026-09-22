@@ -5,14 +5,17 @@
 # The patch (reference/onnxruntime-webgpu.patch) gives every row of a short
 # multi-token pass (2-16 tokens, a speculative verify pass) the same arithmetic
 # as a one-token decode step, and makes those passes cheap:
-#   - MatMulNBits: batched kernel for 2-16 rows; on DP4A GPUs the one-row DP4A
-#     kernel per row (K0).
 #   - GroupQueryAttention decode (1-16 new tokens): FlashAttentionDecodeGQA,
 #     one workgroup per (KV head, KV tile) for all query rows, fixed split-K
 #     (K3). One-token steps use it too.
 #   - q/k RMS norm folded into the rotary kernel for 1-16 tokens (K3).
 #   - LayerNorm/SkipLayerNorm: one workgroup per row for every row count; the
 #     one-row split path is off (K3).
+#   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
+#     activations) where one-token steps use DP4A, else float (float32 or
+#     float16), with the rows in a runtime loop; each weight is read once per
+#     tile of up to 8 rows. One-token steps use it too. Other 2-16-row cases
+#     run the one-row float program per row, never the prefill tile kernels.
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -82,6 +85,17 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc &&
     grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
+  # K4: MatMulNBits for 1-16 rows runs through one pipeline per path (DP4A or
+  # float) with the rows in a runtime loop, and 2-16 rows never reach the
+  # prefill tile kernels.
+  grep -q 'const bool batchable = M >= 1 && M <= kMaxBatchedM' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'ApplyDP4AMatMulNBitsBatched(a, b, scales' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'if (!small_m && CanApplySubgroupMatrixMatMulNBits' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'use_wide_tile_program = !small_m &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
+    grep -q 'DP4AMatMulNBitsBatchedProgram' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
+    grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
+    grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
+      echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
