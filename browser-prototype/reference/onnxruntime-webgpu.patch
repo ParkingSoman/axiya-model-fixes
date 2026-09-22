@@ -463,6 +463,22 @@ index 00807f3..57b5b63 100644
        if (has_qk_norm && !decode_norm_fast_path) {
          qNorm = context.CreateGPUTensor(query->DataType(), query->Shape());
          kNorm = context.CreateGPUTensor(key->DataType(), key->Shape());
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+index c0e3b74..a1bf44f 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
+@@ -177,7 +177,10 @@ Status RunSkipLayerNormProgram(ComputeContext& context,
+   const int components = GetMaxComponents(hidden_size);
+   const bool has_input_skip_bias_sum = input_skip_bias_sum != nullptr;
+   const uint32_t norm_count = onnxruntime::narrow<uint32_t>(x_shape.SizeToDimension(x_shape.NumDimensions() - 1));
+-  const bool split_hidden_dim = hidden_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never split one row over workgroups. The split path
++  // runs only for one row and sums in another order, so a one-token decode step
++  // and a k-token verify pass would normalize the same row to different bits.
++  const bool split_hidden_dim = false && hidden_size % 512 == 0 && norm_count == 1;
+ 
+   const uint32_t skip_size = onnxruntime::narrow<uint32_t>(skip->Shape().Size());
+ 
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
 index e936833..50acfe8 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.cc
@@ -763,3 +779,21 @@ index 0000000..b2d0d90
 +    workgroupBarrier();
 +  }
 +}  // MAIN
+diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+index b303182..85903e3 100644
+--- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+@@ -208,7 +208,12 @@ Status RunLayerNormProgram(ComputeContext& context,
+   const uint32_t norm_size_vectorized = onnxruntime::narrow<uint32_t>((norm_size + components - 1) / components);
+ 
+   // Check if we should use split norm dimension optimization
+-  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never. The split path runs only for one row and sums in
++  // another order than the one-workgroup-per-row path, so a one-token decode
++  // step and a k-token verify pass would normalize the same row to different
++  // bits. On GPUs where MatMulNBits quantizes activations to int8 (DP4A) such
++  // differences grow into different tokens.
++  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+ 
+   LayerNormProgram program{bias != nullptr, simplified, mean != nullptr, inv_std_dev != nullptr, split_norm_dim};
+ 
