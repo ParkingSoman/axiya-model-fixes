@@ -1,3 +1,219 @@
+diff --git a/onnxruntime/contrib_ops/cpu/bert/attention_common.h b/onnxruntime/contrib_ops/cpu/bert/attention_common.h
+index 0c419ff..7f7a899 100644
+--- a/onnxruntime/contrib_ops/cpu/bert/attention_common.h
++++ b/onnxruntime/contrib_ops/cpu/bert/attention_common.h
+@@ -171,7 +171,7 @@ constexpr bool LAYOUT_BNSH = true;
+ // Upper bound on the `state_window` attribute of LinearAttention and CausalConvWithState. The
+ // window only has to cover the tokens a multi-token predictor can propose, and the state tensors
+ // grow linearly with it, so cap it rather than let a model request an unbounded allocation.
+-constexpr int64_t kMaxStateWindow = 8;
++constexpr int64_t kMaxStateWindow = 16;  // ORT fork (K5): a 16-token verify pass
+ 
+ namespace sparse_attention {
+ // Environment variable to enable or disable sparse attention v1 kernel. Default is 0 (enabled).
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
+index a47b313..a66be5a 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
+@@ -44,8 +44,10 @@ CausalConvWithState::CausalConvWithState(const OpKernelInfo& info)
+   ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseDilation(info, dilation_));
+   ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseChannelsLast(info, channels_last_));
+   ORT_ENFORCE(!channels_last_ || ndim_ == 1, "channels_last requires ndim = 1");
+-  ORT_ENFORCE(info.GetAttrOrDefault<int64_t>("state_window", 0) == 0,
+-              "WebGPU CausalConvWithState does not support state_window > 0 (CUDA EP only)");
++  // ORT fork (K5): state_window > 0 is supported for the channels-first 1D layout.
++  ORT_THROW_IF_ERROR(causal_conv_with_state_helper::ParseStateWindow(info, state_window_));
++  ORT_ENFORCE(state_window_ == 0 || !channels_last_,
++              "WebGPU CausalConvWithState supports state_window > 0 only with channels_last = 0");
+ }
+ 
+ Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -69,6 +71,7 @@ Status CausalConvWithStateProgram::GenerateShaderCode(ShaderHelper& shader) cons
+                              WGSL_TEMPLATE_PARAMETER(has_bias, has_bias_),
+                              WGSL_TEMPLATE_PARAMETER(has_conv_state, has_conv_state_),
+                              WGSL_TEMPLATE_PARAMETER(output_present_state, output_present_state_),
++                             WGSL_TEMPLATE_PARAMETER(has_state_window, state_window_ > 0),
+                              WGSL_TEMPLATE_PARAMETER(use_silu, activation_ == CausalConvActivation::Silu));
+ }
+ 
+@@ -165,6 +168,11 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   } else {
+     state_dims = TensorShapeVector{batch_size, channels, state_length};
+   }
++  // ORT fork (K5): with state_window = W the state tensors are (W, <one state>). The past is
++  // read from slot W-1; present slot j is the state after position (input_length - W + j).
++  if (state_window_ > 0) {
++    state_dims.insert(state_dims.begin(), state_window_);
++  }
+   const TensorShape state_shape(state_dims);
+ 
+   if (conv_state != nullptr) {
+@@ -183,6 +191,8 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+   // Output 1: present_state, matching the layout selected by channels_last
+   Tensor* present_state = context.Output(1, state_shape);
+   const bool conv_state_in_present_state = has_conv_state && conv_state->DataRaw() == present_state->DataRaw();
++  ORT_RETURN_IF(state_window_ > 0 && (conv_state_in_present_state || input_shape.Size() == 0),
++                "state_window > 0 needs a non-empty input and distinct past and present state buffers");
+ 
+   if (input_shape.Size() == 0) {
+     if (has_conv_state) {
+@@ -197,12 +207,12 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+ 
+   // Create and run the shader program
+   CausalConvWithStateProgram program{activation_, has_bias, has_conv_state, !conv_state_in_present_state,
+-                                     channels_last_};
++                                     channels_last_, state_window_ > 0};
+ 
+   uint32_t output_size = static_cast<uint32_t>(batch_size * channels * input_length);
+ 
+   program.CacheHint(has_bias, has_conv_state, !conv_state_in_present_state,
+-                    kernel_size, dilation_, static_cast<int>(activation_), channels_last_);
++                    kernel_size, dilation_, static_cast<int>(activation_), channels_last_, state_window_ > 0);
+ 
+   program.AddInput({input, ProgramTensorMetadataDependency::Type})
+       .AddInput({weight, ProgramTensorMetadataDependency::None});
+@@ -226,7 +236,8 @@ Status CausalConvWithState::ComputeInternal(ComputeContext& context) const {
+       .AddUniformVariable({static_cast<uint32_t>(kernel_size)})
+       .AddUniformVariable({static_cast<uint32_t>(dilation_)})
+       .AddUniformVariable({static_cast<uint32_t>(state_length)})
+-      .AddUniformVariable({output_size});
++      .AddUniformVariable({output_size})
++      .AddUniformVariable({static_cast<uint32_t>(state_window_ > 0 ? state_window_ : 1)});
+ 
+   ORT_RETURN_IF_ERROR(context.RunProgram(program));
+ 
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
+index d724261..3fbd46f 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.h
+@@ -28,13 +28,14 @@ CausalConvActivation ParseCausalConvActivation(const std::string& activation_str
+ class CausalConvWithStateProgram final : public Program<CausalConvWithStateProgram> {
+  public:
+   CausalConvWithStateProgram(CausalConvActivation activation, bool has_bias, bool has_conv_state,
+-                             bool output_present_state, bool channels_last)
++                             bool output_present_state, bool channels_last, bool state_window = false)
+       : Program{"CausalConvWithState"},
+         activation_(activation),
+         has_bias_(has_bias),
+         has_conv_state_(has_conv_state),
+         output_present_state_(output_present_state),
+-        channels_last_(channels_last) {}
++        channels_last_(channels_last),
++        state_window_(state_window) {}
+ 
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
+ 
+@@ -45,7 +46,9 @@ class CausalConvWithStateProgram final : public Program<CausalConvWithStateProgr
+       {"kernel_size", ProgramUniformVariableDataType::Uint32},
+       {"dilation", ProgramUniformVariableDataType::Uint32},
+       {"state_length", ProgramUniformVariableDataType::Uint32},
+-      {"output_size", ProgramUniformVariableDataType::Uint32});
++      {"output_size", ProgramUniformVariableDataType::Uint32},
++      // ORT fork (K5): number of window slots (1 when state_window = 0).
++      {"state_window", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   CausalConvActivation activation_;
+@@ -53,6 +56,7 @@ class CausalConvWithStateProgram final : public Program<CausalConvWithStateProgr
+   bool has_conv_state_;
+   bool output_present_state_;
+   bool channels_last_;
++  bool state_window_;  // ORT fork (K5): state tensors carry a leading window axis
+ };
+ 
+ class CausalConvUpdateStateProgram final : public Program<CausalConvUpdateStateProgram> {
+@@ -83,6 +87,7 @@ class CausalConvWithState final : public WebGpuKernel {
+   int64_t ndim_;
+   int dilation_;
+   bool channels_last_;
++  int state_window_;  // ORT fork (K5): 0 or W (state_window attribute)
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
+index 1f95a2f..3deb391 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template
+@@ -5,6 +5,7 @@
+ #param has_bias
+ #param has_conv_state
+ #param output_present_state
++#param has_state_window
+ #param use_silu
+ 
+ #use guardAgainstOutOfBoundsWorkgroupSizes
+@@ -55,6 +56,13 @@ $MAIN {
+   let state_base = (batch_idx * channels + channel_idx) * state_length;
+   let state_pos_stride = 1u;
+ #endif
++#if has_state_window
++  // ORT fork (K5): the past state is slot W-1 of a (W, batch, channels, state_length) tensor.
++  let slot_size = batch_size * channels * state_length;
++  let past_base = (uniforms.state_window - 1u) * slot_size + state_base;
++#else
++  let past_base = state_base;
++#endif
+ 
+   // Perform depthwise causal convolution for this (batch, channel, pos).
+   // The convolution window looks back state_length positions.
+@@ -81,7 +89,7 @@ $MAIN {
+ #if has_conv_state
+     if (virtual_pos < state_length) {
+       // Read from conv_state
+-      val = conv_state[state_base + virtual_pos * state_pos_stride];
++      val = conv_state[past_base + virtual_pos * state_pos_stride];
+     } else {
+       // Read from input
+       let input_pos = virtual_pos - state_length;
+@@ -110,7 +118,38 @@ $MAIN {
+   // Write output
+   output[input_base + pos * input_pos_stride] = acc;
+ 
+-#if output_present_state
++#if output_present_state && has_state_window
++  // ORT fork (K5): present slot j (0 <= j < W) is the state after position p = L - W + j, i.e.
++  // virtual_input[p + 1 .. p + state_length]. The thread at position p writes slot j; slots with
++  // p < 0 (W > L) hold no position of this call and are zero, written by the thread at pos 0.
++  let win_slots = uniforms.state_window;
++  if (pos + win_slots >= input_length) {
++    let slot = pos + win_slots - input_length;
++    for (var s: u32 = 0; s < state_length; s = s + 1) {
++      let vp = pos + 1u + s;
++      var state_val: input_element_t = 0.0;
++#if has_conv_state
++      if (vp < state_length) {
++        state_val = conv_state[past_base + vp * state_pos_stride];
++      } else {
++        state_val = input[input_base + (vp - state_length) * input_pos_stride];
++      }
++#else
++      if (vp >= state_length) {
++        state_val = input[input_base + (vp - state_length) * input_pos_stride];
++      }
++#endif
++      present_state[slot * slot_size + state_base + s * state_pos_stride] = state_val;
++    }
++  }
++  if (pos == 0u && win_slots > input_length) {
++    for (var slot: u32 = 0; slot < win_slots - input_length; slot = slot + 1) {
++      for (var s: u32 = 0; s < state_length; s = s + 1) {
++        present_state[slot * slot_size + state_base + s * state_pos_stride] = input_element_t(0.0);
++      }
++    }
++  }
++#elif output_present_state
+   // Write present_state: the last state_length elements from the
+   // virtual input [conv_state, input]. We only write present_state once
+   // per (batch, channel), using the thread at pos == 0.
+@@ -123,7 +162,7 @@ $MAIN {
+ 
+ #if has_conv_state
+       if (vp < state_length) {
+-        state_val = conv_state[state_base + vp * state_pos_stride];
++        state_val = conv_state[past_base + vp * state_pos_stride];
+       } else {
+         let ip = vp - state_length;
+         state_val = input[input_base + ip * input_pos_stride];
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 index a800232..f743403 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
