@@ -25,12 +25,26 @@
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
+# JSPI build (gemma12b, P2a): besides the asyncify file, ORT can also build a
+# JavaScript Promise Integration wasm (--enable_wasm_jspi, onnxruntime
+# cmake/onnxruntime_webassembly.cmake). It needs the same source tree and
+# patch, just a different link flag and its own cmake build folder, and
+# produces ort-wasm-simd-threaded.jspi.{wasm,mjs} (the OUTPUT_NAME the cmake
+# file picks for onnxruntime_ENABLE_WEBASSEMBLY_JSPI=ON) instead of the
+# .asyncify pair. The worker gives gemma12b's decoder shards to ORT as Blobs
+# in externalData (Phase 0.2); JSPI lets those awaits happen without the
+# asyncify stack-switching overhead. Built by default, next to the asyncify
+# build, unless JSPI=0.
+#
 # Env:
 #   ORT_SRC  checkout folder (cloned here if missing; shallow, with shallow submodules)
 #   PATCH    1 = apply reference/onnxruntime-webgpu.patch (default), 0 = unmodified tag
 #   OUT      folder that receives a full onnxruntime-web dist: the npm 1.30.0 dist
-#            files, with the two asyncify files replaced by this build
-#   BUILD_DIR  cmake build folder (default $ORT_SRC/build/wasm_webgpu)
+#            files, with the asyncify files (and, unless JSPI=0, the jspi files)
+#            replaced by this build
+#   BUILD_DIR  cmake build folder for the asyncify build (default $ORT_SRC/build/wasm_webgpu)
+#   JSPI     1 = also build ort-wasm-simd-threaded.jspi.{wasm,mjs} (default 1), 0 = skip it
+#   BUILD_DIR_JSPI  cmake build folder for the JSPI build (default $ORT_SRC/build/wasm_webgpu_jspi)
 #   PATCH_FILE patch to apply when PATCH=1 (default reference/onnxruntime-webgpu.patch)
 #   FORCE_DP4A 1 = debug build: the DP4A MatMulNBits path also runs on Apple GPUs
 #            (sets ORT_FORK_DEBUG_FORCE_DP4A in dp4a_matmul_nbits.cc), so a Mac
@@ -61,6 +75,8 @@ FORCE_DP4A="${FORCE_DP4A:-0}"
 FUSED_DECODE="${FUSED_DECODE:-1}"
 OUT="${OUT:?set OUT to the output dist folder}"
 BUILD_DIR="${BUILD_DIR:-$ORT_SRC/build/wasm_webgpu}"
+JSPI="${JSPI:-1}"
+BUILD_DIR_JSPI="${BUILD_DIR_JSPI:-$ORT_SRC/build/wasm_webgpu_jspi}"
 
 if [ ! -d "$ORT_SRC/.git" ] && [ ! -f "$ORT_SRC/.git" ]; then
   git clone --depth 1 --branch "$TAG" --recurse-submodules --shallow-submodules \
@@ -152,18 +168,23 @@ if [ -z "$PY" ]; then
   PY="$venv/bin/python3"
 fi
 
-"$PY" tools/ci_build/build.py \
-  --build_dir "$BUILD_DIR" \
-  --parallel --config Release --skip_submodule_sync \
-  --build_wasm --enable_wasm_simd --enable_wasm_threads \
-  --target onnxruntime_webassembly --skip_tests --disable_rtti \
-  --use_webgpu --use_webnn \
-  --enable_wasm_api_exception_catching \
-  --disable_ml_ops --disable_generation_ops \
-  --disable_types string float4 float8 optional sparsetensor \
-  --include_ops_by_config onnxruntime/wasm/reduced_types.config \
-  --enable_reduced_operator_type_support \
+common_build_args=(
+  --parallel --config Release --skip_submodule_sync
+  --build_wasm --enable_wasm_simd --enable_wasm_threads
+  --target onnxruntime_webassembly --skip_tests --disable_rtti
+  --use_webgpu --use_webnn
+  --enable_wasm_api_exception_catching
+  --disable_ml_ops --disable_generation_ops
+  --disable_types string float4 float8 optional sparsetensor
+  --include_ops_by_config onnxruntime/wasm/reduced_types.config
+  --enable_reduced_operator_type_support
   --emsdk_version "$EMSDK_VERSION"
+)
+
+asyncify_start=$(date +%s)
+"$PY" tools/ci_build/build.py --build_dir "$BUILD_DIR" "${common_build_args[@]}"
+asyncify_seconds=$(( $(date +%s) - asyncify_start ))
+echo "asyncify build: ${asyncify_seconds}s"
 
 # The JS API is copied from the app's npm package, so it must be the same
 # onnxruntime version as the tag.
@@ -173,3 +194,18 @@ mkdir -p "$OUT"
 cp "$app"/node_modules/onnxruntime-web/dist/*.mjs "$app"/node_modules/onnxruntime-web/dist/*.wasm "$OUT"/
 cp "$BUILD_DIR/Release/ort-wasm-simd-threaded.asyncify.wasm" "$BUILD_DIR/Release/ort-wasm-simd-threaded.asyncify.mjs" "$OUT"/
 ls -la "$OUT"/ort-wasm-simd-threaded.asyncify.*
+
+if [ "$JSPI" = 1 ]; then
+  # Same source tree and patch, a different cmake build folder (the link
+  # flags differ: -s JSPI=1 instead of -s ASYNCIFY=1), producing
+  # ort-wasm-simd-threaded.jspi.{wasm,mjs} (cmake/onnxruntime_webassembly.cmake
+  # names the target ".jspi" when onnxruntime_ENABLE_WEBASSEMBLY_JSPI=ON).
+  # --enable_wasm_jspi needs --disable_wasm_exception_catching unset, which is
+  # already the case above (neither build passes it).
+  jspi_start=$(date +%s)
+  "$PY" tools/ci_build/build.py --build_dir "$BUILD_DIR_JSPI" --enable_wasm_jspi "${common_build_args[@]}"
+  jspi_seconds=$(( $(date +%s) - jspi_start ))
+  echo "jspi build: ${jspi_seconds}s"
+  cp "$BUILD_DIR_JSPI/Release/ort-wasm-simd-threaded.jspi.wasm" "$BUILD_DIR_JSPI/Release/ort-wasm-simd-threaded.jspi.mjs" "$OUT"/
+  ls -la "$OUT"/ort-wasm-simd-threaded.jspi.*
+fi
