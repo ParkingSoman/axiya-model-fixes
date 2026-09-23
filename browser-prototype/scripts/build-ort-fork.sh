@@ -173,7 +173,6 @@ common_build_args=(
   --build_wasm --enable_wasm_simd --enable_wasm_threads
   --target onnxruntime_webassembly --skip_tests --disable_rtti
   --use_webgpu --use_webnn
-  --enable_wasm_api_exception_catching
   --disable_ml_ops --disable_generation_ops
   --disable_types string float4 float8 optional sparsetensor
   --include_ops_by_config onnxruntime/wasm/reduced_types.config
@@ -182,7 +181,17 @@ common_build_args=(
 )
 
 asyncify_start=$(date +%s)
-"$PY" tools/ci_build/build.py --build_dir "$BUILD_DIR" "${common_build_args[@]}"
+# --enable_wasm_api_exception_catching is asyncify-only: build_args.py's
+# post-processing (`if args.enable_wasm_api_exception_catching:
+# args.disable_wasm_exception_catching = True`) turns it into
+# --disable_wasm_exception_catching, and build.py refuses that combination
+# for a JSPI build ("Cannot set WebAssembly exception catching in JSPI
+# build.", build.py's post-init checks). Confirmed by an actual failed run:
+# the first attempt at this JSPI build passed this flag on both builds and
+# the JSPI build.py invocation logged exactly that error and exited nonzero
+# after printing its parsed Namespace (disable_wasm_exception_catching=True)
+# instead of building.
+"$PY" tools/ci_build/build.py --build_dir "$BUILD_DIR" --enable_wasm_api_exception_catching "${common_build_args[@]}"
 asyncify_seconds=$(( $(date +%s) - asyncify_start ))
 echo "asyncify build: ${asyncify_seconds}s"
 
@@ -200,8 +209,10 @@ if [ "$JSPI" = 1 ]; then
   # flags differ: -s JSPI=1 instead of -s ASYNCIFY=1), producing
   # ort-wasm-simd-threaded.jspi.{wasm,mjs} (cmake/onnxruntime_webassembly.cmake
   # names the target ".jspi" when onnxruntime_ENABLE_WEBASSEMBLY_JSPI=ON).
-  # --enable_wasm_jspi needs --disable_wasm_exception_catching unset, which is
-  # already the case above (neither build passes it).
+  # --enable_wasm_jspi needs --disable_wasm_exception_catching unset (see the
+  # comment above common_build_args): this invocation omits
+  # --enable_wasm_api_exception_catching for exactly that reason, unlike the
+  # asyncify build above.
   jspi_start=$(date +%s)
   "$PY" tools/ci_build/build.py --build_dir "$BUILD_DIR_JSPI" --enable_wasm_jspi "${common_build_args[@]}"
   jspi_seconds=$(( $(date +%s) - jspi_start ))
