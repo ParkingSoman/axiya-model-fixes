@@ -36,6 +36,12 @@
 #     8-bit block stay a struct (BData8) read with select; an
 #     array<vec2<u32>, 4> indexed by the b_idx loop ran about 14x slower on the
 #     M5 with the same output.
+#   - Weight upload (PM, JSPI loader): an external initializer over 16 MB is
+#     read from its Blob and uploaded in 16 MB pieces, and the upload waits for
+#     the GPU queue after every 64 MB. Chrome never shrinks the shared-memory
+#     pool behind staging buffers; before, it kept about 1 GB in the GPU
+#     process after the Gemma 4 12B load, and the loader's JavaScript scratch
+#     buffer kept the size of the largest initializer (1 GB).
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -165,6 +171,11 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
   # q8: the 8-bit wide-tile prefill loop without the indexed array (14x slow).
   grep -q 'fn b_words(data : BData8, b_idx : u32) -> vec2<u32>' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template || {
       echo "reference patch lacks the 8-bit wide-tile fix (BData8); refusing" >&2; exit 1; }
+  # PM: large external initializers go to the GPU in 16 MB pieces with a
+  # queue wait every 64 MB (Chrome's staging shared-memory pool stays small).
+  grep -q 'webgpuUploadPendingBytes >= 64 \* 1024 \* 1024' onnxruntime/wasm/post-webgpu.js &&
+    grep -q 'await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, part, done);' onnxruntime/core/framework/external_data_loader.cc || {
+      echo "reference patch lacks the PM chunked weight upload; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
