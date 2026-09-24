@@ -26,6 +26,10 @@
 #     split-cache attention's Concat + mask Add + Softmax + Cast(float16) + two
 #     Slices in one pass (tools/gemma12b/fuse_split_softmax.py). Same softmax
 #     arithmetic as the WebGPU Softmax program.
+#   - 8-bit wide-tile MatMulNBits prefill (q8): the two vec4<u32> loads of one
+#     8-bit block stay a struct (BData8) read with select; an
+#     array<vec2<u32>, 4> indexed by the b_idx loop ran about 14x slower on the
+#     M5 with the same output.
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -150,6 +154,9 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'SplitMaskedSoftmax, 1,' onnxruntime/core/graph/contrib_ops/bert_defs.cc &&
     grep -q 'Microsoft, 1, SplitMaskedSoftmax)>());' onnxruntime/core/graph/contrib_ops/ms_opset.h || {
       echo "reference patch lacks the P5 SplitMaskedSoftmax op; refusing" >&2; exit 1; }
+  # q8: the 8-bit wide-tile prefill loop without the indexed array (14x slow).
+  grep -q 'fn b_words(data : BData8, b_idx : u32) -> vec2<u32>' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_wide_tile.wgsl.template || {
+      echo "reference patch lacks the 8-bit wide-tile fix (BData8); refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
