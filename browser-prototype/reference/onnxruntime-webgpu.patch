@@ -695,6 +695,268 @@ index c0e3b74..a1bf44f 100644
  
    const uint32_t skip_size = onnxruntime::narrow<uint32_t>(skip->Shape().Size());
  
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
+new file mode 100644
+index 0000000..d0843d5
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
+@@ -0,0 +1,200 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#include <string>
++
++#include "core/providers/webgpu/shader_helper.h"
++#include "core/providers/webgpu/webgpu_utils.h"
++#include "core/providers/webgpu/webgpu_supported_types.h"
++#include "contrib_ops/webgpu/bert/split_masked_softmax.h"
++#include "contrib_ops/webgpu/webgpu_contrib_kernels.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++ONNX_OPERATOR_KERNEL_EX(
++    SplitMaskedSoftmax,
++    kMSDomain,
++    1,
++    kWebGpuExecutionProvider,
++    (*KernelDefBuilder::Create())
++        .TypeConstraint("T", DataTypeImpl::GetTensorType<float>())
++        .TypeConstraint("U", DataTypeImpl::GetTensorType<MLFloat16>()),
++    SplitMaskedSoftmax);
++
++namespace {
++std::string VecType(int components) {
++  return components == 1 ? std::string{"f32"} : "vec" + std::to_string(components) + "<f32>";
++}
++std::string MaxOf(const std::string& v, int components) {
++  switch (components) {
++    case 1:
++      return v;
++    case 2:
++      return "max(" + v + ".x, " + v + ".y)";
++    default:
++      return "max(max(" + v + ".x, " + v + ".y), max(" + v + ".z, " + v + ".w))";
++  }
++}
++}  // namespace
++
++// The body is SoftmaxProgram's (core/providers/webgpu/math/softmax.cc) with
++// x = concat(a, b) + mask read element by element, and the result written as
++// float16 into the a and b outputs. Row r of the scores is row
++// (r % rows_per_head) of head (r / rows_per_head) % heads of batch
++// r / (rows_per_head * heads); the mask row index uses the mask strides
++// (0 where the mask broadcasts).
++Status SplitMaskedSoftmaxProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("a", ShaderUsage::UseUniform);
++  shader.AddInput("b", ShaderUsage::UseUniform);
++  shader.AddInput("mask", ShaderUsage::UseUniform);
++  shader.AddOutput("pa", ShaderUsage::UseUniform);
++  shader.AddOutput("pb", ShaderUsage::UseUniform);
++  const int c = components_;
++  const std::string vt = VecType(c);
++  const char* lane[4] = {"x", "y", "z", "w"};
++
++  auto& impl = shader.AdditionalImplementation();
++  impl << "alias x_value_t = " << vt << ";\n"
++       << "var<workgroup> row_max_shared : x_value_t;\n"
++       << "var<workgroup> row_sum_shared : x_value_t;\n"
++       << "var<workgroup> thread_max_scalar_shared : array<f32, " << wg_ << ">;\n"
++       << "var<workgroup> thread_sum_scalar_shared : array<f32, " << wg_ << ">;\n"
++       << "fn load_one(row : u32, mask_row : u32, e : u32) -> f32 {\n"
++       << "  var s : f32;\n"
++       << "  if (e < uniforms.cols_a) {\n"
++       << "    s = a[row * uniforms.cols_a + e];\n"
++       << "  } else {\n"
++       << "    s = b[row * uniforms.cols_b + (e - uniforms.cols_a)];\n"
++       << "  }\n"
++       << "  return s + mask[mask_row * (uniforms.cols_a + uniforms.cols_b) + e];\n"
++       << "}\n"
++       << "fn get_value(row : u32, mask_row : u32, col : u32) -> x_value_t {\n"
++       << "  let e = col * " << c << "u;\n";
++  if (c == 1) {
++    impl << "  return load_one(row, mask_row, e);\n";
++  } else {
++    impl << "  return x_value_t(";
++    for (int j = 0; j < c; j++) impl << (j ? ", " : "") << "load_one(row, mask_row, e + " << j << "u)";
++    impl << ");\n";
++  }
++  impl << "}\n"
++       << "fn store_one(row : u32, e : u32, p : f32) {\n"
++       << "  if (e < uniforms.cols_a) {\n"
++       << "    pa[row * uniforms.cols_a + e] = f16(p);\n"
++       << "  } else {\n"
++       << "    pb[row * uniforms.cols_b + (e - uniforms.cols_a)] = f16(p);\n"
++       << "  }\n"
++       << "}\n";
++
++  auto& body = shader.MainFunctionBody();
++  body << "  let lindex = local_idx;\n"
++       << "  const wg = " << wg_ << "u;\n"
++       << "  let row = workgroup_idx;\n"
++       << "  let cols = uniforms.packed_cols;\n"
++       << "  let r_in_head = row % uniforms.rows_per_head;\n"
++       << "  let head = (row / uniforms.rows_per_head) % uniforms.heads;\n"
++       << "  let batch = row / (uniforms.rows_per_head * uniforms.heads);\n"
++       << "  let mask_row = batch * uniforms.mask_batch_stride + head * uniforms.mask_head_stride + r_in_head * uniforms.mask_row_stride;\n"
++       << "  var thread_max = f32(-3.4028234663852886e+38f);\n"
++       << "  var thread_sum = f32(0.0);\n"
++       << "  for (var col = lindex; col < cols; col += wg) {\n"
++       << "    let value = get_value(row, mask_row, col);\n"
++       << "    let value_max = f32(" << MaxOf("value", c) << ");\n"
++       << "    let new_max = max(thread_max, value_max);\n"
++       << "    let shifted_exp = exp(value - x_value_t(new_max));\n"
++       << "    thread_sum = thread_sum * exp(thread_max - new_max) + f32(" << SumVector("shifted_exp", c) << ");\n"
++       << "    thread_max = new_max;\n"
++       << "  }\n"
++       << "  thread_max_scalar_shared[lindex] = thread_max;\n"
++       << "  thread_sum_scalar_shared[lindex] = thread_sum;\n"
++       << "  workgroupBarrier();\n"
++       << "  for (var curr_size = wg >> 1; curr_size > 0; curr_size = curr_size >> 1) {\n"
++       << "    if (lindex < curr_size) {\n"
++       << "      let rhs_max = thread_max_scalar_shared[lindex + curr_size];\n"
++       << "      let rhs_sum = thread_sum_scalar_shared[lindex + curr_size];\n"
++       << "      let lhs_max = thread_max_scalar_shared[lindex];\n"
++       << "      let lhs_sum = thread_sum_scalar_shared[lindex];\n"
++       << "      let merged_max = max(lhs_max, rhs_max);\n"
++       << "      thread_sum_scalar_shared[lindex] = lhs_sum * exp(lhs_max - merged_max) + rhs_sum * exp(rhs_max - merged_max);\n"
++       << "      thread_max_scalar_shared[lindex] = merged_max;\n"
++       << "    }\n"
++       << "    workgroupBarrier();\n"
++       << "  }\n"
++       << "  if (lindex == 0) {\n"
++       << "    row_max_shared = x_value_t(thread_max_scalar_shared[0]);\n"
++       << "    row_sum_shared = x_value_t(thread_sum_scalar_shared[0]);\n"
++       << "  }\n"
++       << "  workgroupBarrier();\n"
++       << "  for (var col = lindex; col < cols; col += wg) {\n"
++       << "    var value = exp(get_value(row, mask_row, col) - row_max_shared) / row_sum_shared;\n"
++       << "    value = max(value, x_value_t(0.0));\n";
++  if (c == 1) {
++    body << "    store_one(row, col, value);\n";
++  } else {
++    for (int j = 0; j < c; j++) body << "    store_one(row, col * " << c << "u + " << j << "u, value." << lane[j] << ");\n";
++  }
++  body << "  }\n";
++  return Status::OK();
++}
++
++Status SplitMaskedSoftmax::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
++  const Tensor* a = context.Input(0);
++  const Tensor* b = context.Input(1);
++  const Tensor* mask = context.Input(2);
++  const TensorShape& sa = a->Shape();
++  const TensorShape& sb = b->Shape();
++  const TensorShape& sm = mask->Shape();
++  if (sa.NumDimensions() != 4 || sb.NumDimensions() != 4 || sm.NumDimensions() != 4) {
++    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "SplitMaskedSoftmax: inputs must be 4-D");
++  }
++  for (size_t i = 0; i < 3; i++) {
++    if (sa[i] != sb[i]) {
++      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "SplitMaskedSoftmax: scores_a and scores_b differ before the last axis");
++    }
++  }
++  const int64_t batch = sa[0], heads = sa[1], rows_per_head = sa[2];
++  const int64_t cols_a = sa[3], cols_b = sb[3], cols = cols_a + cols_b;
++  if (sm[3] != cols || (sm[0] != 1 && sm[0] != batch) || (sm[1] != 1 && sm[1] != heads) || (sm[2] != 1 && sm[2] != rows_per_head)) {
++    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "SplitMaskedSoftmax: mask ", sm.ToString(),
++                           " does not broadcast to the scores [", batch, ",", heads, ",", rows_per_head, ",", cols, "]");
++  }
++  Tensor* pa = context.Output(0, sa);
++  Tensor* pb = context.Output(1, sb);
++  const int64_t rows = batch * heads * rows_per_head;
++  if (rows == 0 || cols == 0) {
++    return Status::OK();
++  }
++  // As SoftmaxProgram: the vector width of the whole row, 256 threads for a
++  // single row, else 64.
++  const int components = GetMaxComponents(cols);
++  const uint32_t wg = rows == 1 ? 256 : 64;
++  const uint32_t mask_rows = static_cast<uint32_t>(sm[2]);
++  const uint32_t mask_row_stride = sm[2] == 1 ? 0u : 1u;
++  const uint32_t mask_head_stride = sm[1] == 1 ? 0u : mask_rows;
++  const uint32_t mask_batch_stride = sm[0] == 1 ? 0u : static_cast<uint32_t>(sm[1]) * mask_rows;
++
++  SplitMaskedSoftmaxProgram program{wg, components};
++  program
++      .AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank},
++                  {b, ProgramTensorMetadataDependency::TypeAndRank},
++                  {mask, ProgramTensorMetadataDependency::TypeAndRank}})
++      .AddOutputs({{pa, ProgramTensorMetadataDependency::TypeAndRank}, {pb, ProgramTensorMetadataDependency::TypeAndRank}})
++      .CacheHint(std::to_string(components), std::to_string(wg))
++      .SetWorkgroupSize(wg)
++      .SetDispatchGroupSize(static_cast<uint32_t>(rows))
++      .AddUniformVariables({{static_cast<uint32_t>(cols_a)},
++                            {static_cast<uint32_t>(cols_b)},
++                            {static_cast<uint32_t>(cols / components)},
++                            {static_cast<uint32_t>(rows_per_head)},
++                            {static_cast<uint32_t>(heads)},
++                            {mask_batch_stride},
++                            {mask_head_stride},
++                            {mask_row_stride}});
++  return context.RunProgram(program);
++}
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.h b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.h
+new file mode 100644
+index 0000000..5c4eacd
+--- /dev/null
++++ b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.h
+@@ -0,0 +1,50 @@
++// Copyright (c) Microsoft Corporation. All rights reserved.
++// Licensed under the MIT License.
++
++#pragma once
++
++#include "core/providers/webgpu/program.h"
++#include "core/providers/webgpu/webgpu_kernel.h"
++
++namespace onnxruntime {
++namespace contrib {
++namespace webgpu {
++
++using namespace onnxruntime::webgpu;
++using onnxruntime::webgpu::ComputeContext;
++
++// Fork (Gemma 4 12B split KV cache, P5): one kernel for
++//   Concat(scores_a, scores_b, axis=-1) + mask -> Softmax(axis=-1) -> Cast(float16)
++//   -> Slice back into the a and b parts.
++// The arithmetic mirrors the WebGPU Softmax program (same workgroup size,
++// same vector width over the whole row, same online max/sum and reduction
++// order), so the probabilities equal the unfused ops' output.
++class SplitMaskedSoftmaxProgram final : public Program<SplitMaskedSoftmaxProgram> {
++ public:
++  SplitMaskedSoftmaxProgram(uint32_t wg, int components) : Program{"SplitMaskedSoftmax"}, wg_{wg}, components_{components} {}
++
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"cols_a", ProgramUniformVariableDataType::Uint32},
++                                          {"cols_b", ProgramUniformVariableDataType::Uint32},
++                                          {"packed_cols", ProgramUniformVariableDataType::Uint32},
++                                          {"rows_per_head", ProgramUniformVariableDataType::Uint32},
++                                          {"heads", ProgramUniformVariableDataType::Uint32},
++                                          {"mask_batch_stride", ProgramUniformVariableDataType::Uint32},
++                                          {"mask_head_stride", ProgramUniformVariableDataType::Uint32},
++                                          {"mask_row_stride", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  uint32_t wg_;
++  int components_;
++};
++
++class SplitMaskedSoftmax final : public WebGpuKernel {
++ public:
++  SplitMaskedSoftmax(const OpKernelInfo& info) : WebGpuKernel(info) {}
++  Status ComputeInternal(ComputeContext& context) const override;
++};
++
++}  // namespace webgpu
++}  // namespace contrib
++}  // namespace onnxruntime
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template
 new file mode 100644
 index 0000000..c293842
@@ -1458,6 +1720,74 @@ index 4d88d37..c154569 100644
      Tensor normalized_a = context.CreateGPUTensor(a->DataType(), a->Shape());
  
      if (skip != nullptr) {
+diff --git a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+index d1d9c58..8c9b957 100644
+--- a/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
++++ b/onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc
+@@ -28,6 +28,7 @@ static const BuildKernelCreateInfoFn build_kernel_create_info_function_table[] =
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, Attention)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, BiasAdd)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, CausalConvWithState)>,
++    BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, SplitMaskedSoftmax)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, BiasGelu)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, BiasSplitGelu)>,
+     BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, FastGelu)>,
+diff --git a/onnxruntime/core/graph/contrib_ops/bert_defs.cc b/onnxruntime/core/graph/contrib_ops/bert_defs.cc
+index faa9aca..1abed57 100644
+--- a/onnxruntime/core/graph/contrib_ops/bert_defs.cc
++++ b/onnxruntime/core/graph/contrib_ops/bert_defs.cc
+@@ -3715,5 +3715,31 @@ ONNX_MS_OPERATOR_SET_SCHEMA(
+           propagateShapeFromInputToOutput(ctx, 0, 0);
+         }));
+ 
++
++constexpr const char* SplitMaskedSoftmax_ver1_doc = R"DOC(
++Fork op (WebGPU only). Softmax over the last axis of Concat(scores_a, scores_b) + mask,
++in float32, returned as float16 and split back at the length of scores_a. Same result as
++Concat -> Add(mask) -> Softmax(axis=-1) -> Cast(float16) -> two Slices, in one pass.
++Used by the split-KV-cache attention of the Gemma 4 12B browser graph.
++)DOC";
++
++ONNX_MS_OPERATOR_SET_SCHEMA(
++    SplitMaskedSoftmax, 1,
++    OpSchema()
++        .SetDoc(SplitMaskedSoftmax_ver1_doc)
++        .Input(0, "scores_a", "Scores of the first key part, (B, H, R, Pa)", "T")
++        .Input(1, "scores_b", "Scores of the second key part, (B, H, R, Pb)", "T")
++        .Input(2, "mask", "Additive mask, (1 or B, 1 or H, 1 or R, Pa + Pb)", "T")
++        .Output(0, "probs_a", "Probabilities of the first part, (B, H, R, Pa)", "U")
++        .Output(1, "probs_b", "Probabilities of the second part, (B, H, R, Pb)", "U")
++        .TypeConstraint("T", {"tensor(float)"}, "Scores and mask are float32.")
++        .TypeConstraint("U", {"tensor(float16)"}, "Probabilities are float16.")
++        .TypeAndShapeInferenceFunction([](ONNX_NAMESPACE::InferenceContext& ctx) {
++          updateOutputElemType(ctx, 0, ONNX_NAMESPACE::TensorProto::FLOAT16);
++          updateOutputElemType(ctx, 1, ONNX_NAMESPACE::TensorProto::FLOAT16);
++          propagateShapeFromInputToOutput(ctx, 0, 0);
++          propagateShapeFromInputToOutput(ctx, 1, 1);
++        }));
++
+ }  // namespace contrib
+ }  // namespace onnxruntime
+diff --git a/onnxruntime/core/graph/contrib_ops/ms_opset.h b/onnxruntime/core/graph/contrib_ops/ms_opset.h
+index 50e421b..00bbf48 100644
+--- a/onnxruntime/core/graph/contrib_ops/ms_opset.h
++++ b/onnxruntime/core/graph/contrib_ops/ms_opset.h
+@@ -96,6 +96,7 @@ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, GatedAdd);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NGramHashMapping);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, EngramGate);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, CausalConvWithState);
++class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, SplitMaskedSoftmax);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, VarlenCausalConvWithState);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, MurmurHash3);
+ class ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NGramRepeatBlock);
+@@ -219,6 +220,7 @@ class OpSet_Microsoft_ver1 {
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NGramHashMapping)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, EngramGate)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, CausalConvWithState)>());
++    fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, SplitMaskedSoftmax)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, VarlenCausalConvWithState)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, MurmurHash3)>());
+     fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NGramRepeatBlock)>());
 diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
 index b303182..85903e3 100644
 --- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
