@@ -1341,7 +1341,7 @@ index 49b51d3..776af50 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..a8f2505 100644
+index 45baa67..43845ff 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -112,6 +112,39 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -1384,7 +1384,7 @@ index 45baa67..a8f2505 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +255,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,9 +255,102 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -1392,11 +1392,18 @@ index 45baa67..a8f2505 100644
 +  // a speculative verify pass). Each row must get the same bits for every M,
 +  // so that a k-token pass and k plain decode steps give the same outputs and
 +  // pick the same tokens. The fork runs M = 1..16 through one pipeline per
-+  // path (DP4A or float), with the rows in a runtime loop: a row runs the same
-+  // instructions whatever M is. (Two different kernels would not do: Metal
-+  // compiles WebGPU shaders in relaxed math mode, which may reassociate float
-+  // sums differently in each kernel.) The batched programs read each weight
-+  // once per tile of up to kBatchedMaxRowsPerTile rows.
++  // path (DP4A or float), so M never selects another kernel. (Two different
++  // kernels would not do: Metal compiles WebGPU shaders in relaxed math mode,
++  // which may reassociate float sums differently in each kernel.) The DP4A
++  // program keeps the rows in a runtime loop, so a row runs the same
++  // instructions whatever M is. The float program (PK) keeps 16 row
++  // accumulators in registers: each row runs its own inlined copy of one
++  // helper function (row_sums), in a branch that M decides. Bit identity
++  // across those copies is verified on the Apple M5 only (op check, every row
++  // of every M = 2..16); other GPUs, other Apple GPU families included, are
++  // not verified. A mismatch could change output only at near ties. The
++  // batched programs read each weight once per tile of up to
++  // kBatchedMaxRowsPerTile rows.
 +  constexpr uint32_t kMinBatchedM = 2;
 +  constexpr uint32_t kMaxBatchedM = 16;
 +  const bool small_m = M >= kMinBatchedM && M <= kMaxBatchedM;
@@ -1481,7 +1488,7 @@ index 45baa67..a8f2505 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +359,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +366,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -1554,10 +1561,10 @@ index bf56d4f..ef71563 100644
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
-index 0000000..5790320
+index 0000000..0a8a16e
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,312 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -1565,17 +1572,22 @@ index 0000000..5790320
 +// activation type, float32 or float16): one-token decode steps (M = 1) and
 +// short multi-token passes such as a speculative verify pass (M = 2..16).
 +//
-+// Row invariance: a row gets the same bits for every M.
++// Row invariance: a row gets the same bits for every M (verified on the
++// Apple M5 only, see below).
 +//   - One pipeline serves every M (M is a uniform, not in the cache key).
-+//   - Every row of the tile runs the same code: the helper functions
-+//     row_sums (per B word) and store_row (lane sums to workgroup memory),
-+//     called once per row with that row's A offset and that row's own
-+//     accumulator. A row's sums never depend on the other rows or on M; rows
-+//     past M are skipped by uniform branches.
-+//     (Metal compiles WebGPU shaders in relaxed math mode, which may
-+//     reassociate float sums. The op check scripts/gemma12b-engine-check.mjs
-+//     STEPS=mnb MNB_ALL_ROWS=1 compares every row of every M = 2..16 with the
-+//     one-row result, bit for bit.)
++//   - Every row of the tile runs its own inlined copy of the same helper
++//     functions: row_sums (per B word) and store_row (lane sums to workgroup
++//     memory), called once per row with that row's A offset and that row's
++//     own accumulator. A row's sums never depend on the other rows or on M;
++//     rows past M are skipped by uniform branches.
++//   - The copies are separate instructions. Metal compiles WebGPU shaders in
++//     relaxed math mode, which may reassociate float sums, so in principle
++//     two copies could round differently. The op check
++//     scripts/gemma12b-engine-check.mjs STEPS=mnb MNB_ALL_ROWS=1 compares
++//     every row of every M = 2..16 with the one-row result, bit for bit: 0
++//     differences on the Apple M5. Other GPUs, other Apple GPU families
++//     included, are not verified. A mismatch there could change output only
++//     at near ties.
 +//   - The summation order of a row is fixed:
 +//       lane l of k_lanes owns the B words w = l, l + k_lanes, ...;
 +//       per word: acc_l += dot(a0, b0) + dot(a1, b1) (4 bits) or dot(a0, b)

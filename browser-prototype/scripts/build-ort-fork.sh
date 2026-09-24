@@ -17,10 +17,11 @@
 #     float16); each weight is read once per tile of up to 16 rows. One-token
 #     steps use it too. DP4A keeps the rows in a runtime loop. The float
 #     kernel (PK) keeps 16 row accumulators in registers, each row updated by
-#     the same helper function, so an extra row costs about 1/16 of a weight
-#     pass instead of almost a whole one (k = 16 pass: 6.6 -> 2.5 plain
-#     steps on the M5). Other 2-16-row cases run the one-row float program
-#     per row, never the prefill tile kernels.
+#     its own inlined copy of one helper function, so an extra row costs about
+#     1/16 of a weight pass instead of almost a whole one (k = 16 pass: 6.6 ->
+#     2.5 plain steps on the M5). Bit identity across those row copies is
+#     verified on the Apple M5 only. Other 2-16-row cases run the one-row
+#     float program per row, never the prefill tile kernels.
 #   - CausalConvWithState with state_window (K5): the WebGPU kernel keeps the
 #     conv state after each of the last W positions (W <= 16), so a speculative
 #     pass can roll back to an accepted prefix. The app fuses the decoder's
@@ -136,8 +137,9 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
   # K4: MatMulNBits for 1-16 rows runs through one pipeline per path (DP4A or
-  # float) with the rows in a runtime loop, and 2-16 rows never reach the
-  # prefill tile kernels.
+  # float), and 2-16 rows never reach the prefill tile kernels. DP4A keeps the
+  # rows in a runtime loop; the float kernel (PK) has 16 register accumulators,
+  # one inlined row_sums copy per row.
   grep -q 'const bool batchable = M >= 1 && M <= kMaxBatchedM' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'ApplyDP4AMatMulNBitsBatched(a, b, scales' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'if (!small_m && CanApplySubgroupMatrixMatMulNBits' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
