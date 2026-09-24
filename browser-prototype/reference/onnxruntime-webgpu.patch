@@ -697,10 +697,10 @@ index c0e3b74..a1bf44f 100644
  
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
 new file mode 100644
-index 0000000..d0843d5
+index 0000000..db661fb
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,208 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -859,6 +859,14 @@ index 0000000..d0843d5
 +  }
 +  const int64_t batch = sa[0], heads = sa[1], rows_per_head = sa[2];
 +  const int64_t cols_a = sa[3], cols_b = sb[3], cols = cols_a + cols_b;
++  // Each part needs at least one column. The gemma12b graph always has one
++  // (the stable part holds the pad slot, the recent part this run's tokens);
++  // an empty part is a caller error, not a case to compute.
++  if (cols_a == 0 || cols_b == 0) {
++    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
++                           "SplitMaskedSoftmax: scores_a and scores_b must each have at least one column (got ",
++                           cols_a, " and ", cols_b, ")");
++  }
 +  if (sm[3] != cols || (sm[0] != 1 && sm[0] != batch) || (sm[1] != 1 && sm[1] != heads) || (sm[2] != 1 && sm[2] != rows_per_head)) {
 +    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "SplitMaskedSoftmax: mask ", sm.ToString(),
 +                           " does not broadcast to the scores [", batch, ",", heads, ",", rows_per_head, ",", cols, "]");
@@ -866,7 +874,7 @@ index 0000000..d0843d5
 +  Tensor* pa = context.Output(0, sa);
 +  Tensor* pb = context.Output(1, sb);
 +  const int64_t rows = batch * heads * rows_per_head;
-+  if (rows == 0 || cols == 0) {
++  if (rows == 0) {
 +    return Status::OK();
 +  }
 +  // As SoftmaxProgram: the vector width of the whole row, 256 threads for a
