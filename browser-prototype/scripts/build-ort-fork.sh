@@ -22,6 +22,10 @@
 #     conv layers into this op at load (VITE_CONV_STATE, src/conv-state.js).
 #   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
 #     (FUSED_DECODE below).
+#   - SplitMaskedSoftmax (P5, com.microsoft, WebGPU only): the gemma12b
+#     split-cache attention's Concat + mask Add + Softmax + Cast(float16) + two
+#     Slices in one pass (tools/gemma12b/fuse_split_softmax.py). Same softmax
+#     arithmetic as the WebGPU Softmax program.
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
@@ -140,6 +144,12 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'ParseStateWindow(info, state_window_)' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc &&
     grep -q '#if output_present_state && has_state_window' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template || {
       echo "reference patch lacks the K5 CausalConvWithState state window; refusing" >&2; exit 1; }
+  # P5: the fused split-cache attention softmax (com.microsoft SplitMaskedSoftmax),
+  # which a gemma12b decoder built with build.py --fuse-softmax needs.
+  grep -q 'SplitMaskedSoftmax)>' onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc &&
+    grep -q 'SplitMaskedSoftmax, 1,' onnxruntime/core/graph/contrib_ops/bert_defs.cc &&
+    grep -q 'Microsoft, 1, SplitMaskedSoftmax)>());' onnxruntime/core/graph/contrib_ops/ms_opset.h || {
+      echo "reference patch lacks the P5 SplitMaskedSoftmax op; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
