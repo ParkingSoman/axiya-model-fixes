@@ -1871,3 +1871,21 @@ index b303182..85903e3 100644
  
    LayerNormProgram program{bias != nullptr, simplified, mean != nullptr, inv_std_dev != nullptr, split_norm_dim};
  
+diff --git a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
+index 250b115..871ecc4 100644
+--- a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
+@@ -68,7 +68,12 @@ Status RMSNorm::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) co
+   }
+ 
+   // Check if we should use split norm dimension optimization
+-  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never (same rule as LayerNorm in layer_norm.cc). The
++  // split path runs only for one row (for example a global layer's k_norm, one
++  // row of 512 at S = 1) and sums in another order than the
++  // one-workgroup-per-row path, so a one-token decode step and a k-token
++  // verify pass would normalize the same row to different bits.
++  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+ 
+   // Reuse LayerNormProgram with simplified=true, has_bias=false, no mean output
+   LayerNormProgram program{/*has_bias=*/false, /*simplified=*/true, /*has_mean_output=*/false,

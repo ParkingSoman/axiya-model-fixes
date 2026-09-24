@@ -10,7 +10,8 @@
 #     (K3). One-token steps use it too.
 #   - q/k RMS norm folded into the rotary kernel for 1-16 tokens (K3).
 #   - LayerNorm/SkipLayerNorm: one workgroup per row for every row count; the
-#     one-row split path is off (K3).
+#     one-row split path is off (K3). RMSNormalization too (PK): gemma12b's
+#     global-layer k_norm is one row of 512 at S = 1.
 #   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
 #     activations) where one-token steps use DP4A, else float (float32 or
 #     float16), with the rows in a runtime loop; each weight is read once per
@@ -127,6 +128,7 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
   grep -q 'FlashAttentionDecodeGQAProgram' onnxruntime/contrib_ops/webgpu/bert/flash_attention.h &&
     grep -q 'decode_norm_fast_path = has_qk_norm && parameters.sequence_length_ <= 16' onnxruntime/contrib_ops/webgpu/bert/group_query_attention.cc &&
     grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/layer_norm.cc &&
+    grep -q 'split_norm_dim = false' onnxruntime/core/providers/webgpu/nn/rms_norm.cc &&
     grep -q 'split_hidden_dim = false' onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc || {
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
   # K4: MatMulNBits for 1-16 rows runs through one pipeline per path (DP4A or
