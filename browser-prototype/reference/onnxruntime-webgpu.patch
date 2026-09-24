@@ -2063,3 +2063,79 @@ index 250b115..871ecc4 100644
  
    // Reuse LayerNormProgram with simplified=true, has_bias=false, no mean output
    LayerNormProgram program{/*has_bias=*/false, /*simplified=*/true, /*has_mean_output=*/false,
+diff --git a/onnxruntime/core/framework/external_data_loader.cc b/onnxruntime/core/framework/external_data_loader.cc
+--- a/onnxruntime/core/framework/external_data_loader.cc
++++ b/onnxruntime/core/framework/external_data_loader.cc
+@@ -70,6 +70,22 @@
+       }
+       if (length === 0) {
+         data = new Uint8Array(0);
++      } else if (load_type === 1 && Module.webgpuUploadExternalBuffer && length > 16777216) {
++        // BlinkFix fork (PM): a large GPU initializer goes up in 16 MB pieces,
++        // each read from the Blob and uploaded at its offset. No JavaScript
++        // buffer the size of the whole initializer (the scratch below grew to
++        // the largest one, 1 GB for Gemma 4 12B's output layer, and stayed),
++        // and the upload's staging memory stays bounded (post-webgpu.js).
++        const piece = 16777216;
++        for (let done = 0; done < length; done += piece) {
++          const n = Math.min(piece, length - done);
++          const part = new Uint8Array(await fileData.slice(offset + done, offset + done + n).arrayBuffer());
++          if (part.byteLength !== n) {
++            return 5;  // Reading from the Blob returned an unexpected number of bytes.
++          }
++          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, part, done);
++        }
++        return 0;
+       } else {
+         // Stream into a reused scratch buffer rather than slice().arrayBuffer(), which
+         // creates a large short-lived buffer per initializer and inflates peak memory.
+@@ -148,7 +164,8 @@
+         // Load external data to GPU.
+         // TODO: use a unified interface for upload external buffer.
+         if (Module.webgpuUploadExternalBuffer) {
+-          Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
++          // BlinkFix fork (PM): wait when the upload asks for it (post-webgpu.js).
++          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
+         } else {
+           Module.jsepUploadExternalBuffer(dataIdOrBuffer, data);
+         }
+diff --git a/onnxruntime/wasm/post-webgpu.js b/onnxruntime/wasm/post-webgpu.js
+--- a/onnxruntime/wasm/post-webgpu.js
++++ b/onnxruntime/wasm/post-webgpu.js
+@@ -209,7 +209,17 @@
+   };
+ 
+   // Setup a callback function for loading external buffers (model weights).
+-  Module.webgpuUploadExternalBuffer = (bufferHandle, data) => {
++  //
++  // BlinkFix fork (PM): `data` goes `dstOffset` bytes into the buffer (the
++  // JSPI loader uploads a large initializer in 16 MB pieces), and after every
++  // 64 MB handed to the GPU the function returns a Promise that resolves once
++  // the queue has done that work; the JSPI loader awaits it. Chrome keeps the
++  // shared memory of each staging buffer in a pool that never shrinks, so
++  // without the wait the pool grows to the bytes in flight: about 1 GB left in
++  // the GPU process after loading Gemma 4 12B. With it the pool stays small.
++  // Callers that do not await (the asyncify loader) are unaffected.
++  let webgpuUploadPendingBytes = 0;
++  Module.webgpuUploadExternalBuffer = (bufferHandle, data, dstOffset = 0) => {
+     const srcArrayBuffer = data.buffer;
+     const srcOffset = data.byteOffset;
+     const srcLength = data.byteLength;
+@@ -252,10 +262,16 @@
+       gpuBufferForUploading,
+       0,
+       gpuBuffer,
+-      0,
++      dstOffset,
+       size
+     );
+     webgpuCurrentDevice.queue.submit([commandEncoder.finish()]);
+     gpuBufferForUploading.destroy();
++    webgpuUploadPendingBytes += size;
++    if (webgpuUploadPendingBytes >= 64 * 1024 * 1024) {
++      webgpuUploadPendingBytes = 0;
++      return webgpuCurrentDevice["queue"]["onSubmittedWorkDone"]();
++    }
++    return undefined;
+   };
+ };
