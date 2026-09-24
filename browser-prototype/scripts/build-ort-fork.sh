@@ -14,9 +14,13 @@
 #     global-layer k_norm is one row of 512 at S = 1.
 #   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
 #     activations) where one-token steps use DP4A, else float (float32 or
-#     float16), with the rows in a runtime loop; each weight is read once per
-#     tile of up to 16 rows. One-token steps use it too. Other 2-16-row cases
-#     run the one-row float program per row, never the prefill tile kernels.
+#     float16); each weight is read once per tile of up to 16 rows. One-token
+#     steps use it too. DP4A keeps the rows in a runtime loop. The float
+#     kernel (PK) keeps 16 row accumulators in registers, each row updated by
+#     the same helper function, so an extra row costs about 1/16 of a weight
+#     pass instead of almost a whole one (k = 16 pass: 6.6 -> 2.5 plain
+#     steps on the M5). Other 2-16-row cases run the one-row float program
+#     per row, never the prefill tile kernels.
 #   - CausalConvWithState with state_window (K5): the WebGPU kernel keeps the
 #     conv state after each of the last W positions (W <= 16), so a speculative
 #     pass can roll back to an accepted prefix. The app fuses the decoder's
@@ -142,7 +146,7 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q '^#define ORT_FORK_FUSED_DECODE [01]$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
     grep -q 'ORT_FORK_FUSED_DECODE != 0 &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc &&
     grep -q 'M != 1 || ORT_FORK_FUSED_DECODE == 0' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc &&
-    grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
+    grep -q 'acc15 += row_sums(a_base + 15u \* K_of_a, w,' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
       echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }
   # K5: CausalConvWithState state window on WebGPU, up to 16 slots.

@@ -1341,18 +1341,10 @@ index 49b51d3..776af50 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..30dfdd8 100644
+index 45baa67..a8f2505 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-@@ -1,6 +1,7 @@
- // Copyright (c) Microsoft Corporation. All rights reserved.
- // Licensed under the MIT License.
- 
-+#include <algorithm>
- #include <string>
- #include <string_view>
- 
-@@ -112,6 +113,36 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -112,6 +112,39 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -1369,6 +1361,10 @@ index 45baa67..30dfdd8 100644
 +  const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
 +  ORT_ENFORCE(a.NumComponents() == 4, "MatMulNBitsBatched needs K % 4 == 0.");
 +  ORT_ENFORCE(WorkgroupSizeX() == col_groups_ * k_lanes_, "workgroup size must be col_groups * k_lanes.");
++  // The template has 16 explicit row accumulators (vec4: 4 columns per
++  // thread) and reduces 4 rows at a time.
++  ORT_ENFORCE(tile_rows_ == 16 && reduce_rows_ == 4 && cols_per_thread_ == 4,
++              "MatMulNBitsBatched needs tile_rows 16, reduce_rows 4 and cols_per_thread 4.");
 +
 +  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_batched.wgsl.template",
 +                             WGSL_TEMPLATE_PARAMETER(col_groups, col_groups_),
@@ -1379,7 +1375,6 @@ index 45baa67..30dfdd8 100644
 +                             WGSL_TEMPLATE_PARAMETER(n_bits, nbits_),
 +                             WGSL_TEMPLATE_PARAMETER(output_type_i32, false),
 +                             WGSL_TEMPLATE_PARAMETER(reduce_rows, reduce_rows_),
-+                             WGSL_TEMPLATE_PARAMETER(tile_rows, tile_rows_),
 +                             WGSL_TEMPLATE_VARIABLE(a, a),
 +                             WGSL_TEMPLATE_VARIABLE(b, b),
 +                             WGSL_TEMPLATE_VARIABLE(output, output),
@@ -1389,7 +1384,7 @@ index 45baa67..30dfdd8 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +253,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,9 +255,95 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -1437,9 +1432,9 @@ index 45baa67..30dfdd8 100644
 +    constexpr uint32_t cols_per_thread = 4;
 +    constexpr uint32_t cols_per_wg = cols_per_thread * col_groups;
 +    constexpr uint32_t tile_rows = kBatchedMaxRowsPerTile;
-+    const uint32_t element_bytes = y->DataType() == DataTypeImpl::GetType<MLFloat16>() ? 2u : 4u;
-+    // Lane sums for the final reduction in workgroup memory: at most 8 KB.
-+    const uint32_t reduce_rows = std::max(1u, std::min(tile_rows, 8192u / (cols_per_wg * k_lanes * element_bytes)));
++    // Lane sums for the final reduction in workgroup memory, 4 rows at a
++    // time: 4 KB (float16) or 8 KB (float32).
++    constexpr uint32_t reduce_rows = 4;
 +    // Row tiles of equal size (one tile for M <= kBatchedMaxRowsPerTile). M
 +    // and the tile size are uniforms, so every M uses the same pipeline.
 +    const uint32_t num_M_tile = CeilDiv(M, tile_rows);
@@ -1486,7 +1481,7 @@ index 45baa67..30dfdd8 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +357,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +359,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -1559,10 +1554,10 @@ index bf56d4f..ef71563 100644
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
-index 0000000..b403600
+index 0000000..5790320
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,307 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -1572,28 +1567,38 @@ index 0000000..b403600
 +//
 +// Row invariance: a row gets the same bits for every M.
 +//   - One pipeline serves every M (M is a uniform, not in the cache key).
-+//   - The rows of a row tile are a runtime loop, so every row runs the same
-+//     instructions, and a row's sums never depend on the other rows.
++//   - Every row of the tile runs the same code: the helper functions
++//     row_sums (per B word) and store_row (lane sums to workgroup memory),
++//     called once per row with that row's A offset and that row's own
++//     accumulator. A row's sums never depend on the other rows or on M; rows
++//     past M are skipped by uniform branches.
 +//     (Metal compiles WebGPU shaders in relaxed math mode, which may
-+//     reassociate float sums; two different kernels, or two unrolled copies of
-+//     one expression, need not give the same bits.)
++//     reassociate float sums. The op check scripts/gemma12b-engine-check.mjs
++//     STEPS=mnb MNB_ALL_ROWS=1 compares every row of every M = 2..16 with the
++//     one-row result, bit for bit.)
 +//   - The summation order of a row is fixed:
 +//       lane l of k_lanes owns the B words w = l, l + k_lanes, ...;
 +//       per word: acc_l += dot(a0, b0) + dot(a1, b1) (4 bits) or dot(a0, b)
 +//       (8 bits);
 +//       output = 0; output += acc_l for l = 0 .. k_lanes - 1; output += bias.
 +//
-+// Speed: one workgroup computes up to tile_rows rows for cols_per_wg columns;
-+// each B word is read and dequantized once for all rows of the tile.
++// Speed: one workgroup computes up to 16 rows for cols_per_wg columns; each
++// B word is read and dequantized once for all rows of the tile. The 16 row
++// accumulators are separate variables (vec4, one component per column of the
++// thread), so they stay in registers: an accumulator array indexed by a
++// runtime row loop was kept in memory and cost almost a full weight pass per
++// extra row on the M5. Row m's step sits inside row m - 1's branch, so a
++// one-row step tests one condition per B word (16 flat branches made M = 1
++// about 10 % slower than this).
 +//
 +// Requirements (checked on the host): A has 4 components (K % 4 == 0), K is a
-+// multiple of block_size, block_size a multiple of 32 / n_bits, n_bits 4 or 8.
++// multiple of block_size, block_size a multiple of 32 / n_bits, n_bits 4 or 8,
++// tile_rows 16, reduce_rows 4, cols_per_thread 4.
 +
 +#param n_bits
 +#param has_zero_points
 +#param has_bias
 +#param output_type_i32
-+#param tile_rows
 +#param reduce_rows
 +#param cols_per_thread
 +#param col_groups
@@ -1607,8 +1612,56 @@ index 0000000..b403600
 +const wg_threads = col_groups * k_lanes;
 +const elements_per_word = 32u / n_bits;
 +
-+// Lane sums for the final reduction: [row][column slot][lane].
++alias acc_t = vec4<output_element_t>;
++
++// Lane sums for the final reduction: [row of the phase][column slot][lane].
 +var<workgroup> partials: array<array<output_element_t, k_lanes>, reduce_rows * cols_per_wg>;
++
++#if n_bits == 4
++// One row's four column sums for B word w (k = 8w .. 8w+7).
++fn row_sums(a_row : u32, w : u32, b_lo : array<acc_t, 4>, b_hi : array<acc_t, 4>) -> acc_t {
++  let a0 = a.getByOffset(a_row + 2 * w);
++  let a1 = a.getByOffset(a_row + 2 * w + 1);
++  return acc_t(dot(a0, b_lo[0]) + dot(a1, b_hi[0]),
++               dot(a0, b_lo[1]) + dot(a1, b_hi[1]),
++               dot(a0, b_lo[2]) + dot(a1, b_hi[2]),
++               dot(a0, b_lo[3]) + dot(a1, b_hi[3]));
++}
++#else
++// One row's four column sums for B word w (k = 4w .. 4w+3).
++fn row_sums(a_row : u32, w : u32, bv : array<acc_t, 4>) -> acc_t {
++  let a0 = a.getByOffset(a_row + w);
++  return acc_t(dot(a0, bv[0]), dot(a0, bv[1]), dot(a0, bv[2]), dot(a0, bv[3]));
++}
++#endif
++
++// Row r (of the phase) lane sums of this thread's four columns.
++fn store_row(r : u32, group : u32, lane : u32, acc : acc_t) {
++  let slot = r * cols_per_wg + group * cols_per_thread;
++  partials[slot][lane] = acc[0];
++  partials[slot + 1][lane] = acc[1];
++  partials[slot + 2][lane] = acc[2];
++  partials[slot + 3][lane] = acc[3];
++}
++
++// Sums the lane sums of rows mb .. mb + reduce_rows - 1 in lane order and
++// writes them.
++fn reduce_phase(batch : u32, row0 : u32, mb : u32, rows : u32, n_base : u32, local_idx : u32) {
++  for (var t = local_idx; t < reduce_rows * cols_per_wg; t += wg_threads) {
++    let r = t / cols_per_wg;
++    let col = n_base + t % cols_per_wg;
++    if (mb + r < rows && col < uniforms.N) {
++      var output_value = output_element_t(0);
++      for (var l = 0u; l < k_lanes; l++) {
++        output_value += partials[t][l];
++      }
++#if has_bias
++      output_value += bias[col];
++#endif
++      output.setByOffset(batch * uniforms.M * uniforms.N + (row0 + mb + r) * uniforms.N + col, output_value);
++    }
++  }
++}
 +
 +$MAIN {
 +  // A dispatch above 65535 workgroups is split into a 2-D grid that can hold
@@ -1628,15 +1681,31 @@ index 0000000..b403600
 +  let group = local_idx / k_lanes;
 +  let col0 = n_base + group * cols_per_thread;
 +  let a_base = batch * uniforms.M * uniforms.K_of_a + row0 * uniforms.K_of_a;
++  let K_of_a = uniforms.K_of_a;
 +
-+  var acc: array<array<output_element_t, cols_per_thread>, tile_rows>;
++  var acc0 = acc_t(0);
++  var acc1 = acc_t(0);
++  var acc2 = acc_t(0);
++  var acc3 = acc_t(0);
++  var acc4 = acc_t(0);
++  var acc5 = acc_t(0);
++  var acc6 = acc_t(0);
++  var acc7 = acc_t(0);
++  var acc8 = acc_t(0);
++  var acc9 = acc_t(0);
++  var acc10 = acc_t(0);
++  var acc11 = acc_t(0);
++  var acc12 = acc_t(0);
++  var acc13 = acc_t(0);
++  var acc14 = acc_t(0);
++  var acc15 = acc_t(0);
 +
 +  for (var w = lane; w < uniforms.words; w += k_lanes) {
 +    let block_idx = (w * elements_per_word) / uniforms.block_size;
 +#if n_bits == 4
 +    // Word w holds k = 8w .. 8w+7: element 2j in the low nibble of byte j.
-+    var b_lo: array<vec4<output_element_t>, cols_per_thread>;
-+    var b_hi: array<vec4<output_element_t>, cols_per_thread>;
++    var b_lo: array<acc_t, 4>;
++    var b_hi: array<acc_t, 4>;
 +    for (var c = 0u; c < cols_per_thread; c++) {
 +      let col = min(col0 + c, uniforms.N - 1);
 +      let q = b.getByOffset(col * uniforms.words + w);
@@ -1649,7 +1718,7 @@ index 0000000..b403600
 +    }
 +#else
 +    // Word w holds k = 4w .. 4w+3, one byte each.
-+    var bv: array<vec4<output_element_t>, cols_per_thread>;
++    var bv: array<acc_t, 4>;
 +    for (var c = 0u; c < cols_per_thread; c++) {
 +      let col = min(col0 + c, uniforms.N - 1);
 +      let q = b.getByOffset(col * uniforms.words + w);
@@ -1658,49 +1727,142 @@ index 0000000..b403600
 +      bv[c] = (vec4<output_element_t>(unpack4xU8(q)) - vec4<output_element_t>(zero)) * scale;
 +    }
 +#endif
-+    // Runtime loop over the rows of the tile: the same instructions for every row.
-+    for (var m = 0u; m < rows; m++) {
++    // Every row: the same call, with its own A offset and accumulator.
 +#if n_bits == 4
-+      let a0 = a.getByOffset(a_base + m * uniforms.K_of_a + 2 * w);
-+      let a1 = a.getByOffset(a_base + m * uniforms.K_of_a + 2 * w + 1);
-+      for (var c = 0u; c < cols_per_thread; c++) {
-+        acc[m][c] += dot(a0, b_lo[c]) + dot(a1, b_hi[c]);
++    if (rows > 0u) {
++      acc0 += row_sums(a_base + 0u * K_of_a, w, b_lo, b_hi);
++      if (rows > 1u) {
++        acc1 += row_sums(a_base + 1u * K_of_a, w, b_lo, b_hi);
++        if (rows > 2u) {
++          acc2 += row_sums(a_base + 2u * K_of_a, w, b_lo, b_hi);
++          if (rows > 3u) {
++            acc3 += row_sums(a_base + 3u * K_of_a, w, b_lo, b_hi);
++            if (rows > 4u) {
++              acc4 += row_sums(a_base + 4u * K_of_a, w, b_lo, b_hi);
++              if (rows > 5u) {
++                acc5 += row_sums(a_base + 5u * K_of_a, w, b_lo, b_hi);
++                if (rows > 6u) {
++                  acc6 += row_sums(a_base + 6u * K_of_a, w, b_lo, b_hi);
++                  if (rows > 7u) {
++                    acc7 += row_sums(a_base + 7u * K_of_a, w, b_lo, b_hi);
++                    if (rows > 8u) {
++                      acc8 += row_sums(a_base + 8u * K_of_a, w, b_lo, b_hi);
++                      if (rows > 9u) {
++                        acc9 += row_sums(a_base + 9u * K_of_a, w, b_lo, b_hi);
++                        if (rows > 10u) {
++                          acc10 += row_sums(a_base + 10u * K_of_a, w, b_lo, b_hi);
++                          if (rows > 11u) {
++                            acc11 += row_sums(a_base + 11u * K_of_a, w, b_lo, b_hi);
++                            if (rows > 12u) {
++                              acc12 += row_sums(a_base + 12u * K_of_a, w, b_lo, b_hi);
++                              if (rows > 13u) {
++                                acc13 += row_sums(a_base + 13u * K_of_a, w, b_lo, b_hi);
++                                if (rows > 14u) {
++                                  acc14 += row_sums(a_base + 14u * K_of_a, w, b_lo, b_hi);
++                                  if (rows > 15u) {
++                                    acc15 += row_sums(a_base + 15u * K_of_a, w, b_lo, b_hi);
++                                  }
++                                }
++                              }
++                            }
++                          }
++                        }
++                      }
++                    }
++                  }
++                }
++              }
++            }
++          }
++        }
 +      }
-+#else
-+      let a0 = a.getByOffset(a_base + m * uniforms.K_of_a + w);
-+      for (var c = 0u; c < cols_per_thread; c++) {
-+        acc[m][c] += dot(a0, bv[c]);
-+      }
-+#endif
 +    }
++#else
++    if (rows > 0u) {
++      acc0 += row_sums(a_base + 0u * K_of_a, w, bv);
++      if (rows > 1u) {
++        acc1 += row_sums(a_base + 1u * K_of_a, w, bv);
++        if (rows > 2u) {
++          acc2 += row_sums(a_base + 2u * K_of_a, w, bv);
++          if (rows > 3u) {
++            acc3 += row_sums(a_base + 3u * K_of_a, w, bv);
++            if (rows > 4u) {
++              acc4 += row_sums(a_base + 4u * K_of_a, w, bv);
++              if (rows > 5u) {
++                acc5 += row_sums(a_base + 5u * K_of_a, w, bv);
++                if (rows > 6u) {
++                  acc6 += row_sums(a_base + 6u * K_of_a, w, bv);
++                  if (rows > 7u) {
++                    acc7 += row_sums(a_base + 7u * K_of_a, w, bv);
++                    if (rows > 8u) {
++                      acc8 += row_sums(a_base + 8u * K_of_a, w, bv);
++                      if (rows > 9u) {
++                        acc9 += row_sums(a_base + 9u * K_of_a, w, bv);
++                        if (rows > 10u) {
++                          acc10 += row_sums(a_base + 10u * K_of_a, w, bv);
++                          if (rows > 11u) {
++                            acc11 += row_sums(a_base + 11u * K_of_a, w, bv);
++                            if (rows > 12u) {
++                              acc12 += row_sums(a_base + 12u * K_of_a, w, bv);
++                              if (rows > 13u) {
++                                acc13 += row_sums(a_base + 13u * K_of_a, w, bv);
++                                if (rows > 14u) {
++                                  acc14 += row_sums(a_base + 14u * K_of_a, w, bv);
++                                  if (rows > 15u) {
++                                    acc15 += row_sums(a_base + 15u * K_of_a, w, bv);
++                                  }
++                                }
++                              }
++                            }
++                          }
++                        }
++                      }
++                    }
++                  }
++                }
++              }
++            }
++          }
++        }
++      }
++    }
++#endif
 +  }
 +
 +  // Sum the k_lanes lane sums of every (row, column) in lane order,
 +  // reduce_rows rows at a time.
-+  for (var mb = 0u; mb < tile_rows; mb += reduce_rows) {
-+    for (var r = 0u; r < reduce_rows; r++) {
-+      if (mb + r < rows) {
-+        for (var c = 0u; c < cols_per_thread; c++) {
-+          partials[r * cols_per_wg + group * cols_per_thread + c][lane] = acc[mb + r][c];
-+        }
-+      }
-+    }
++  if (rows > 0u) { store_row(0u, group, lane, acc0); }
++  if (rows > 1u) { store_row(1u, group, lane, acc1); }
++  if (rows > 2u) { store_row(2u, group, lane, acc2); }
++  if (rows > 3u) { store_row(3u, group, lane, acc3); }
++  workgroupBarrier();
++  reduce_phase(batch, row0, 0u, rows, n_base, local_idx);
++  workgroupBarrier();
++  if (rows > 4u) {
++    store_row(0u, group, lane, acc4);
++    if (rows > 5u) { store_row(1u, group, lane, acc5); }
++    if (rows > 6u) { store_row(2u, group, lane, acc6); }
++    if (rows > 7u) { store_row(3u, group, lane, acc7); }
 +    workgroupBarrier();
-+    for (var t = local_idx; t < reduce_rows * cols_per_wg; t += wg_threads) {
-+      let r = t / cols_per_wg;
-+      let col = n_base + t % cols_per_wg;
-+      if (mb + r < rows && col < uniforms.N) {
-+        var output_value = output_element_t(0);
-+        for (var l = 0u; l < k_lanes; l++) {
-+          output_value += partials[t][l];
-+        }
-+#if has_bias
-+        output_value += bias[col];
-+#endif
-+        output.setByOffset(batch * uniforms.M * uniforms.N + (row0 + mb + r) * uniforms.N + col, output_value);
-+      }
-+    }
++    reduce_phase(batch, row0, 4u, rows, n_base, local_idx);
 +    workgroupBarrier();
++  }
++  if (rows > 8u) {
++    store_row(0u, group, lane, acc8);
++    if (rows > 9u) { store_row(1u, group, lane, acc9); }
++    if (rows > 10u) { store_row(2u, group, lane, acc10); }
++    if (rows > 11u) { store_row(3u, group, lane, acc11); }
++    workgroupBarrier();
++    reduce_phase(batch, row0, 8u, rows, n_base, local_idx);
++    workgroupBarrier();
++  }
++  if (rows > 12u) {
++    store_row(0u, group, lane, acc12);
++    if (rows > 13u) { store_row(1u, group, lane, acc13); }
++    if (rows > 14u) { store_row(2u, group, lane, acc14); }
++    if (rows > 15u) { store_row(3u, group, lane, acc15); }
++    workgroupBarrier();
++    reduce_phase(batch, row0, 12u, rows, n_base, local_idx);
 +  }
 +}  // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc
