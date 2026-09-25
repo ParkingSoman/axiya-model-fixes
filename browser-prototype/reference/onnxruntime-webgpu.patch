@@ -697,10 +697,10 @@ index c0e3b74..a1bf44f 100644
  
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
 new file mode 100644
-index 0000000..f4ea99e
+index 0000000..4cc041e
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,215 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -877,8 +877,8 @@ index 0000000..f4ea99e
 +  if (rows == 0) {
 +    return Status::OK();
 +  }
-+  // Scalar columns (not SoftmaxProgram's vector width of the whole row), 256
-+  // threads for a single row, else 64. Thread i then reduces columns i, i +
++  // Scalar columns (not SoftmaxProgram's vector width of the whole row) and
++  // 64 threads. Thread i then reduces columns i, i +
 +  // wg, ... whatever the row length, so a row's sums do not depend on how many
 +  // columns the pass has: the extra columns of a k-token verify pass are
 +  // masked (exp gives exactly 0) and come after the row's own columns. A
@@ -886,7 +886,8 @@ index 0000000..f4ea99e
 +  // and changed the sums, so a verify pass and one-token steps disagreed in
 +  // the last bits (lowmem C1, scripts/lowmem-batchinv.html).
 +  const int components = 1;
-+  const uint32_t wg = rows == 1 ? 256 : 64;
++  // One workgroup size for every row count (stock: 256 threads for one row).
++  const uint32_t wg = 64;
 +  const uint32_t mask_rows = static_cast<uint32_t>(sm[2]);
 +  const uint32_t mask_row_stride = sm[2] == 1 ? 0u : 1u;
 +  const uint32_t mask_head_stride = sm[1] == 1 ? 0u : mask_rows;
@@ -2163,3 +2164,62 @@ index 5658cca..4d8cf38 100644
      ReduceSharedProgram program(name_, reduce_op_type, workgroup_size);
      program.CacheHint(keepdims_,
                        noop_with_empty_axes_,
+diff --git a/onnxruntime/core/providers/webgpu/math/matmul.cc b/onnxruntime/core/providers/webgpu/math/matmul.cc
+index 6515757..7ade01d 100644
+--- a/onnxruntime/core/providers/webgpu/math/matmul.cc
++++ b/onnxruntime/core/providers/webgpu/math/matmul.cc
+@@ -156,6 +156,17 @@ Status MatMul::ComputeInternal(ComputeContext& context) const {
+                        /*is_channels_last=*/true, compute_cache_, b_is_constant_);
+ }
+ 
++// Batch-invariant fork (lowmem): a decode or speculative verify pass feeds 1
++// to 16 tokens, so an attention MatMul sees up to 16 x 16 = 256 rows. For
++// every row count up to that, one program must compute each output row, with
++// one tile shape and one order of sums: then a k-token pass and k one-token
++// steps give the same bits on any GPU. Stock ORT picked the program by the
++// row count (tile shape at M <= 8, Intel subgroup MatMul at M >= 64, the
++// subgroup-matrix MatMul when M fills a tile) and split K with atomic adds,
++// whose order is not deterministic. Those fast paths now start above 256 rows
++// (page prefill); split-K is off.
++constexpr int64_t kBatchInvariantMaxRows = 256;
++
+ Status ComputeMatMul(ComputeContext* context,
+                      const Activation& activation, std::vector<const Tensor*>& inputs, Tensor* output_tensor, bool is_channels_last,
+                      MatMulOptImplCache& cache,
+@@ -171,7 +182,7 @@ Status ComputeMatMul(ComputeContext* context,
+   MatMulComputeHelper helper;
+   ORT_THROW_IF_ERROR(helper.Compute(logical_a_shape, logical_b_shape));
+ 
+-  MatMulOptImpl* subgroup_impl = cache.GetOrCreate(*context);
++  MatMulOptImpl* subgroup_impl = helper.M() > kBatchInvariantMaxRows ? cache.GetOrCreate(*context) : nullptr;
+   if (subgroup_impl != nullptr) {
+     bool handled = false;
+     ORT_RETURN_IF_ERROR(subgroup_impl->Compute(
+@@ -219,7 +230,7 @@ Status ComputeMatMul(ComputeContext* context,
+     return context->RunProgram(program);
+   }
+ 
+-  if (intel::CanApplyMatMulIntel(*context, helper.M(), helper.N(), helper.K())) {
++  if (helper.M() > kBatchInvariantMaxRows && intel::CanApplyMatMulIntel(*context, helper.M(), helper.N(), helper.K())) {
+     return intel::ApplyMatMulIntel(*context, activation, inputs, output_tensor, is_channels_last);
+   }
+ 
+@@ -263,7 +274,7 @@ Status ComputeMatMul(ComputeContext* context,
+ 
+   const bool is_vec4 = dim_inner % 4 == 0 && dim_b_outer % 4 == 0;
+ 
+-  InlinedVector<int64_t> elements_per_thread = dim_a_outer <= 8
++  InlinedVector<int64_t> elements_per_thread = dim_a_outer <= kBatchInvariantMaxRows
+                                                    ? InlinedVector<int64_t>({4, 1, 1})
+                                                    : InlinedVector<int64_t>({4, 4, 1});
+ 
+@@ -286,7 +297,8 @@ Status ComputeMatMul(ComputeContext* context,
+   uint32_t splits_per_batch = 1;
+ 
+   // Current Split-K implementation relies on atomic operations, which are not deterministic.
+-  if (!context->KernelContext().GetUseDeterministicCompute()) {
++  // Batch-invariant fork: never used (see kBatchInvariantMaxRows).
++  if (false && !context->KernelContext().GetUseDeterministicCompute()) {
+     const SplitKConfig& split_k_config = context->GetSplitKConfig();
+     const bool need_split_k = split_k_config.UseSplitK(
+         is_vec4, activation.activation_kind_, batch_size, dim_a_outer, dim_b_outer,

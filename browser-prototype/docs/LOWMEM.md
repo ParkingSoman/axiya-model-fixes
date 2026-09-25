@@ -26,7 +26,7 @@ are guesses. No Windows machine has run this build.
 | B2 hybrid LM head | done | GPU peak -0.3 to -0.4 GB; exact re-check ~2 ms a token; app build flag `VITE_LM_HYBRID=1` |
 | B3 decoder in parts | done (experiment) | no per-boundary cost once warmed (`docs/LOWMEM-STREAM.md`; code on branch `lowmem/stream-canonical`, not merged) |
 | B4 single fallback | superseded | user decision 2026-09-25: streamed layers (hc30) + MTP + hybrid head is the only path; no fallback |
-| C1 speculative = greedy | done | kernel fixes (fork dist `binv`); same-cache check 4/4 pages, also on the streamed path; a GPU that fails the load-time self-check fails the load (user decision) |
+| C1 speculative = greedy | done | kernel choices independent of the pass size on every GPU (fork dist `inv`); same-cache check 4/4 pages, also on the streamed path; no runtime self-check, near-tie guard off |
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
@@ -61,7 +61,7 @@ fixed fork build (`gate-binv.json`).
 | Item | Value |
 |---|---|
 | Model package | `/Users/shonusengupta/BlinkFix-models/gemma-12b-q4/` (`decoder.onnx` `a6c6f4ea…`, the fix2 trim graph) |
-| Fork dist | `ort-fork-dist-binv` (since C1; before: `ort-fork-dist-pm-a`), copied to `.local/ort-fork-dist`; pinned by `reference/ort-fork-dist.json` |
+| Fork dist | `ort-fork-dist-inv` (before: `binv`, `pm-a`), copied to `.local/ort-fork-dist`; pinned by `reference/ort-fork-dist.json` |
 | Browser profile (model cached) | `agent-a1a20012219348d7d/browser-prototype/evidence/gemma12b-profile` |
 | Degraded scans | `evidence/lowmem/scans/` (made by `make_scans.py` there): openstax and mathfuncs page 1, 150 DPI, grey, 1.3° and −1.8° skew, blur, noise, specks, JPEG q45, image-only PDF |
 | Unit tests | 895 tests, 884 pass, 9 known failures (the baseline) |
@@ -367,6 +367,34 @@ The norms (`RMSNormalization`, `SkipSimplifiedLayerNormalization`) and
 Both fixes are in `reference/onnxruntime-webgpu.patch`. The fork source is at
 `BlinkFix-models/tmp-g12/ort-fork-src`, and the new dist is
 `BlinkFix-models/ort-fork-dist-binv` (JSPI and asyncify rebuilt).
+
+### Every kernel choice independent of the pass size (fork dist `inv`)
+
+WebGPU gives the same bits for the same program and inputs on one GPU. The
+bug was that ORT chose the program by the number of rows, so a k-token pass and
+k one-token steps could run different code. After the two fixes above, an audit
+of the kernels on the decode path found more such choices, on non-Apple GPUs:
+
+| Kernel | Choice by row count (stock / binv) | Now |
+|---|---|---|
+| MatMul | tile shape 4x1 up to 8 rows, 4x4 above | 4x1 up to 256 rows |
+| MatMul, Intel | subgroup program from 64 rows (its tile also by rows) | only above 256 rows |
+| MatMul, subgroup-matrix GPUs | used when the rows fill a tile | only above 256 rows |
+| MatMul, Intel Xe2/Xe3 | split-K with atomic adds (order not deterministic) | never |
+| SplitMaskedSoftmax | 256 threads for one row | always 64 |
+
+256 rows covers every decode and verify pass (up to 16 tokens x 16 query heads
+of a global layer). Above that (page prefill) the fast paths stay. The
+`MatMulNBits` weights path was already one program for 1 to 16 rows. Norms,
+elementwise ops and rotary do not depend on the row count.
+
+Checks on this Mac with `ort-fork-dist-inv`: 320 of 320 attention cases
+identical; MTP equal to greedy from one cache on mathfuncs (420 tokens) and
+openstax (600), with the near-tie guard on and off. The Intel and subgroup-matrix
+paths cannot run on this Mac: there the fix holds by construction (the same
+program for every pass size), not by a hardware test. The load-time self-check
+was removed (user decision), and the near-tie guard is off by default (it only
+cost speed: mathfuncs 10.9 against 12.5 tok/s).
 
 ### Decode check with the fixed build [Mac]
 
