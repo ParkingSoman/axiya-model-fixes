@@ -30,7 +30,7 @@ are guesses. No Windows machine has run this build.
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
-| C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer (unit tests); app run on three-pages.pdf: 3 pages in order, no errors (the run did not record page 2's backlog at the switch); cancel drops the queue |
+| C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer, and the editor keeps a page live until its page-complete reaches the display. App, three-pages.pdf: page 2 saved at 41.5 s, its live text still grew to 1,087 characters at 55.9 s while page 3 decoded; cancel drops the queue |
 | C5 pause instead of restart | done | |
 
 The canonical path (default build since 2026-09-25): 30 layers streamed
