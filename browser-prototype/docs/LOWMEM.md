@@ -24,12 +24,12 @@ are guesses. No Windows machine has run this build.
 | A3 shared weight buffers | done | works, no copy |
 | B1 fixed short context | **open** | only fix2's trim is in; fixed-capacity global KV and freeing the vision session are not built |
 | B2 hybrid LM head | done | GPU peak -0.3 to -0.4 GB; exact re-check ~2 ms a token; app build flag `VITE_LM_HYBRID=1` |
-| B3 decoder in parts | done (experiment) | no per-boundary cost once warmed (see `LOWMEM-STREAM.md`) |
+| B3 decoder in parts | done (experiment) | no per-boundary cost once warmed (`docs/LOWMEM-STREAM.md`; code on branch `lowmem/stream-canonical`, not merged) |
 | B4 single fallback | **open, superseded?** | the streaming study (branch `lowmem/stream-canonical`, `docs/LOWMEM-STREAM.md`) proposes streamed layers + MTP as the only path; the user decides |
-| C1 speculative = greedy | done | kernel fixes (fork dist `binv`); same-cache check 4/4 pages; load-time self-check turns MTP off on a GPU that fails it |
+| C1 speculative = greedy | done | kernel fixes (fork dist `binv`); same-cache check 4/4 pages; load-time self-check turns MTP off (greedy) on a GPU that fails it (only when the load warms up; the app always does) |
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
-| C4 page 1 before Convert | done | first text 1.3 to 1.6 s after Convert |
+| C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
 | C4 lookahead (next page while reading) | **parked** | options for the user: slice interleave or a display-side page queue |
 | C5 pause instead of restart | done | |
 
