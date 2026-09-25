@@ -190,3 +190,30 @@ Gate pages, 5,789 positions (`evidence/lowmem/a2/cert-gate.json`), `asym`:
   would match here, but nothing proves it for every page. That is a
   non-exact change, so it is the user's decision (saving about 0.55 GB of GPU
   memory).
+
+## C5: an AI edit pauses a page instead of restarting it
+
+Before: an AI edit terminated the worker. The model loaded again for the edit,
+and the page ran again from the start (a second load and a full prefill).
+
+Now (gemma12b build, `InferenceQueue` option `pausable`):
+
+| Step | What happens |
+|---|---|
+| Edit arrives | The queue sends `pause` to the worker. |
+| Worker | The engine stops between two decode steps, keeps the page's KV cache and streamer, and answers the page request with status `paused`. |
+| Edit | Runs on the same worker, with the model loaded. |
+| Page | The queue sends it again with `resumeFrom`. The engine feeds the last id on the kept cache and continues greedily. The live text continues; it does not restart. |
+| Fallbacks | A worker that answers `pause-unsupported`, or no answer within 120 s, gets the old path (terminate, run again). A cancelled paused page is dropped in the worker (`dropSuspended`); a new page also drops an old paused one. |
+
+Files: `src/engine.js`, `src/gemma12b/engine.js`, `src/gemma12b/generate.js`,
+`src/gemma12b/speculative.js`, `src/inference.worker.js`, `src/app.js`.
+Tests: `tests/queue-pause.test.mjs` (6), `tests/gemma12b-engine.test.mjs` (3 new).
+
+Real check [Mac] (`STEPS=pause`, `evidence/lowmem/c5-pause.json`): mathfuncs at
+budget 1120, paused at token 100, a text-only edit ran while the paused page
+held its 100 tokens, then the page resumed. **The 352 ids are identical to the
+Stage 0 gate**, and the figure-crop info (`pageCrops`) is the same.
+
+A resume decodes greedily (no drafter). The ids are the same by construction.
+The paused page's KV stays in GPU memory while the edit runs.
