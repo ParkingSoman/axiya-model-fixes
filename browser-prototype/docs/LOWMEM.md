@@ -22,20 +22,30 @@ are guesses. No Windows machine has run this build.
 | A1 MTP drafter (llama.cpp) | done | 2.56 / 3.44 tokens a pass (n = 2 / 4) |
 | A2 certificate | done, failed the bar | the user chose the hybrid head instead |
 | A3 shared weight buffers | done | works, no copy |
-| B1 fixed short context | **open** | only fix2's trim is in; fixed-capacity global KV and freeing the vision session are not built |
+| B1 fixed short context | done (measured; not used) | global band built and tested, off in the app (0.1 GB saved, ~6% slower); buffer-cache modes: bucket best; vision session kept (0.15 GB) |
 | B2 hybrid LM head | done | GPU peak -0.3 to -0.4 GB; exact re-check ~2 ms a token; app build flag `VITE_LM_HYBRID=1` |
 | B3 decoder in parts | done (experiment) | no per-boundary cost once warmed (`docs/LOWMEM-STREAM.md`; code on branch `lowmem/stream-canonical`, not merged) |
-| B4 single fallback | **open, superseded?** | the streaming study (branch `lowmem/stream-canonical`, `docs/LOWMEM-STREAM.md`) proposes streamed layers + MTP as the only path; the user decides |
-| C1 speculative = greedy | done | kernel fixes (fork dist `binv`); same-cache check 4/4 pages; load-time self-check turns MTP off (greedy) on a GPU that fails it (only when the load warms up; the app always does) |
+| B4 single fallback | superseded | user decision 2026-09-25: streamed layers (hc30) + MTP + hybrid head is the only path; no fallback |
+| C1 speculative = greedy | done | kernel fixes (fork dist `binv`); same-cache check 4/4 pages, also on the streamed path; a GPU that fails the load-time self-check fails the load (user decision) |
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
-| C4 lookahead (next page while reading) | **parked** | options for the user: slice interleave or a display-side page queue |
+| C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer |
 | C5 pause instead of restart | done | |
 
-Not met yet: the GPU peak target. Best measured peak is 9.42 GB (hybrid head);
-the plan's target is 7.0 GB. The streaming study reaches 6.7 GB (30 layers
-streamed), at 8.1 tok/s (openstax) and 4.7 tok/s (long prose page) on the Mac.
+The canonical path (default build since 2026-09-25): 30 layers streamed
+(layout `hc30`), MTP, hybrid LM head.
+
+| Page (app, Mac) | GPU peak | Decode | First text after Convert |
+|---|---|---|---|
+| smoke | 6.66 GB | 8.0 tok/s | 1.7 s |
+| mathfuncs | 6.86 GB | 9.7 tok/s | 1.65 s |
+| three-pages.pdf (3 pages) | 6.86 GB | | 2.0 s |
+| long page, engine check (2,741 tokens) | 7.07 GB | 4.75 tok/s | |
+
+The long page ends slightly above 7.0 GB: the peak still grows with page
+length (6.76 GB at 600 tokens). Iris Xe speed is estimated only (2 to 4.5
+tok/s, `docs/LOWMEM-STREAM.md`).
 
 Open finding: vision features vary at rounding level with the session's
 history (C1 section). The kernel is not found.
@@ -458,6 +468,30 @@ token then, about 2 ms now.)
   at the end) where the earlier app runs stopped: the same near tie, decided by
   the session-history effect above, not by the prefetch path (the text is
   identical up to that point).
+
+## B1: the global layers' cache in bands [Mac]
+
+Each KV merge made slightly larger global tensors, so a freed one never fit
+the next request and ORT's buffer cache grew with the page. Engine option
+`globalBand` (kvNames, PastCache.extra, kv-merge.js `global_start`): a global
+tensor holds a whole number of bands, with the unused slots masked at the
+front. Checks: a CPU run of the merge graph (onnxruntime-node) gives the
+expected layout; the fake engine gives the same ids with 7 tensor sizes
+instead of 25; on the GPU, MTP equals greedy from one cache (mathfuncs,
+openstax to 600 tokens).
+
+| Long page, canonical path | Tokens | GPU footprint / peak | MTP tok/s |
+|---|---|---|---|
+| no band | 2,741 | 6.96 / 7.07 GB | 4.75 |
+| band 1,024 | 2,720 | 6.86 / 6.96 GB | 4.47 |
+
+The band saved about 0.1 GB and the peak still grew, so another source of
+growth remains (not found). One run each; the speed difference may be noise.
+The app does not use the band.
+
+Buffer-cache modes on the canonical path (openstax, 600 tokens): bucket
+6.66 / 6.76 GB, 13.9 tok/s (kept); simple 10.5 GB; lazyRelease 5.2 GB at rest
+but a 9.0 GB peak.
 
 ## B3 / B4: the decoder in parts, and weights streamed through a GPU ring [Mac]
 
