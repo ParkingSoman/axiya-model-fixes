@@ -217,3 +217,114 @@ Stage 0 gate**, and the figure-crop info (`pageCrops`) is the same.
 
 A resume decodes greedily (no drafter). The ids are the same by construction.
 The paused page's KV stays in GPU memory while the edit runs.
+
+## Phase A0: image budget 560 vs 1120 — text accuracy [Mac]
+
+Native llama.cpp (the same QAT model, the app's prompts, greedy, thinking off,
+image tokens fixed at the budget, 4 pages at a time), `scripts/lowmem-a0-llama.mjs`.
+Scored with the pinned olmOCR scorer (`f7cfe4c`), `tools/lowmem/a0_score.py`.
+Files: `evidence/lowmem/a0/llama-budget{560,1120}.json`, `score-summary.json`.
+
+Subset, fixed before any result (the user's 15-minute rule cut it twice): the
+first 2 PDFs of each bench-v2 category (12) plus openstax, 80 olmOCR checks.
+Each page is capped at 1,500 output tokens at both budgets.
+
+| Budget | Checks passed (figure blocks removed) | Raw text | Pages at the cap |
+|---|---|---|---|
+| 1120 | **50 / 80** | 49 / 80 | 4 |
+| 560 | **29 / 80** | 29 / 80 | 6 (adds a table page and the degraded mathfuncs scan, which normally ends at about 358 tokens) |
+
+Paired: 22 checks pass only at 1120, 1 only at 560 (sign test p < 0.001).
+
+| Category | 560 | 1120 |
+|---|---|---|
+| table_tests | 9 / 17 | 16 / 17 |
+| multi_column | 2 / 10 | 7 / 10 |
+| continuity (math, tables) | 9 / 21 | 15 / 21 |
+| long_tiny_text | 3 / 15 | 6 / 15 |
+| headers_footers | 1 / 5 | 2 / 5 |
+| old_scans | 5 / 12 | 4 / 12 |
+
+| Check type | 560 | 1120 |
+|---|---|---|
+| table | 9 / 24 | 19 / 24 |
+| order | 5 / 17 | 10 / 17 |
+| present | 9 / 27 | 13 / 27 |
+| math | 2 / 4 | 4 / 4 |
+| absent | 4 / 8 | 4 / 8 |
+
+Caveats:
+- Small sample (about 10 checks per category). It shows only a large effect.
+  The effect here is large.
+- llama.cpp resizes some pages differently from the app (test-4's figure box
+  sits about 65/1000 higher than the app's), so the app-engine check below
+  confirms the table loss on the app's own path.
+- The 1,500-token cap cuts the longest pages at both budgets.
+
+App-engine confirmation (the app's own image path; engine check `STEPS=gate`,
+greedy, 1,500-token cap; `evidence/lowmem/a0app/`): the 2 table pages that 560
+lost most on in llama.cpp.
+
+| Budget | olmOCR checks passed (18) | discoverworld table | 0091c5b pg3 table |
+|---|---|---|---|
+| 1120 | **12** | cap (1,500) | ends at 1,462 tokens |
+| 560 | **6** | cap (1,500) | cap (1,500); an extra empty table column; a wrong cell ("22 (14)" where 1120 reads "15 (9)") |
+
+These pages were chosen because llama.cpp showed the loss there, so this
+confirms the direction on the app's path, not the size.
+
+## C1: why speculative runs differ from greedy [Mac]
+
+Engine check `STEPS=vcheck` (`evidence/lowmem/c1-vcheck.json`): the long page's
+ids teacher-forced; at positions 1,200 to 2,440 the last row of a k-token verify
+pass (k = 2, 4, 8, 16) is compared with a one-token step on the same cache.
+
+| Measure | Value |
+|---|---|
+| Logits that differ (of 262,144) | about 215,000 to 230,000 at every position and k |
+| Largest difference | 0.41 (k = 2 at position 2,000); typical 0.11 to 0.30 |
+| Argmax changed at the checked positions | no (their top-2 gaps were 0.69 to 7.7) |
+
+So at long contexts the GPU sums depend on the number of rows in a pass (the
+Phase 6 bit-identity was measured on shorter pages). A near tie smaller than
+about 0.4 can flip, which explains the different words on the long page.
+
+Fix (implemented, `speculativeGenerate` option `nearTie`): a verify row whose
+top two logits are closer than ε decides nothing; the pass stops there and a
+one-token step (the path greedy takes) decides that token. ε = 1.0, about 2.4x
+the largest measured difference. This is an empirical margin, not a proof: the
+KV entries written by multi-row passes can also differ slightly. The C1 pass
+rule (3 speculative runs identical to greedy on the gate pages) stays the test.
+
+## B3 / B4: the decoder in parts, and weights streamed through a GPU ring [Mac]
+
+`tools/gemma12b/split_decoder.py` cuts `decoder.onnx` into consecutive layer-group
+graphs that read the same weight shards (no weight bytes copied). With
+`--stream-parts`, a part's layer weights become graph inputs, and
+`decoder.stream.json` lists where their bytes are. `loadGemma12b` options
+`decoderParts` and `streamParts` run the parts in order (the residual stream is
+passed on the GPU) and write streamed weights into one of two GPU buffer slots
+before each run (`Tensor.fromGpuBuffer`, as A3 showed).
+
+B4 check (`evidence/lowmem/b4-stream2.json`): layers 0 and 1 streamed (123 MB
+each, 246 MB a token), layers 2-23 and 24-47 resident, budget 1120, greedy.
+
+| Page | Tokens | Same ids as the Stage 0 gate | Decode |
+|---|---|---|---|
+| smoke | 25 | IDENTICAL | – |
+| mathfuncs | 352 | IDENTICAL | 6.4 tok/s (baseline 11.1) |
+
+- The output is exact: streaming changes where the weights live, not the math.
+- B3 alone (the plain cut at layer 24, 2 parts, nothing streamed;
+  `evidence/lowmem/b3-split24.json`): IDENTICAL on smoke and mathfuncs, but
+  mathfuncs decodes at 8.8 tok/s (113 ms a token against about 90 ms whole).
+  So each part boundary costs about 20 ms a token. Suspects: the mask and
+  position sub-graphs that every part rebuilds (some of their nodes run on the
+  CPU) and per-run overhead. One part per streamed layer would be far too slow;
+  this must be profiled and cut before the fallback relies on many parts.
+- Decode is 66 ms a token slower. The 246 MB upload explains about 20 ms at
+  12 GB/s; the rest is the four parts' per-run overhead. Not yet profiled.
+- This test build holds the 1.07 GB token table twice (part 0 for the embedding
+  lookup, part 3 for the LM head), so its GPU peak (10.85 GB) is not a memory
+  result. The real build must share one copy (a graph input fed from one GPU
+  buffer, as A3 showed) or move it to the CPU (the hybrid LM head).
