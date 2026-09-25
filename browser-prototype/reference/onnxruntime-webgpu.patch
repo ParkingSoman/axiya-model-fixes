@@ -697,10 +697,10 @@ index c0e3b74..a1bf44f 100644
  
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
 new file mode 100644
-index 0000000..db661fb
+index 0000000..f4ea99e
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/bert/split_masked_softmax.cc
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,214 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -877,9 +877,15 @@ index 0000000..db661fb
 +  if (rows == 0) {
 +    return Status::OK();
 +  }
-+  // As SoftmaxProgram: the vector width of the whole row, 256 threads for a
-+  // single row, else 64.
-+  const int components = GetMaxComponents(cols);
++  // Scalar columns (not SoftmaxProgram's vector width of the whole row), 256
++  // threads for a single row, else 64. Thread i then reduces columns i, i +
++  // wg, ... whatever the row length, so a row's sums do not depend on how many
++  // columns the pass has: the extra columns of a k-token verify pass are
++  // masked (exp gives exactly 0) and come after the row's own columns. A
++  // vector width taken from the row length (1, 2 or 4) regrouped the columns
++  // and changed the sums, so a verify pass and one-token steps disagreed in
++  // the last bits (lowmem C1, scripts/lowmem-batchinv.html).
++  const int components = 1;
 +  const uint32_t wg = rows == 1 ? 256 : 64;
 +  const uint32_t mask_rows = static_cast<uint32_t>(sm[2]);
 +  const uint32_t mask_row_stride = sm[2] == 1 ? 0u : 1u;
