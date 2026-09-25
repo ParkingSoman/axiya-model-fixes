@@ -415,9 +415,16 @@ token then, about 2 ms now.)
 | mathfuncs | 352 (eos) | 16.4 | 10.7 s | 9.63 GB |
 
 - The re-check took 5.8 s of mathfuncs' 21.5 s decode (fixed since, above).
-- First text came 10.7 s after Convert: the page-1 prefill did not help in
-  this run. Not investigated yet (the harness may choose the file only at
-  Convert time).
+- First text came 10.7 s after Convert: the page-1 prefill never ran. Two
+  causes, both fixed (commit 47354dd): the screen hook had been edited in the
+  generated `public/screens/` (overwritten by `scripts/prepare.mjs`), and a PDF
+  chosen before the load started was dropped (`src/prefetch-gate.js` now keeps
+  it). After the fix: first text 1.3 s (smoke) and 1.6 s (mathfuncs) after
+  Convert; mathfuncs decode 19.3 tok/s with the bound-only guard.
+- The prefetched mathfuncs run went past index 351 (420 tokens, a figure block
+  at the end) where the earlier app runs stopped: the same near tie, decided by
+  the session-history effect above, not by the prefetch path (the text is
+  identical up to that point).
 
 ## B3 / B4: the decoder in parts, and weights streamed through a GPU ring [Mac]
 
