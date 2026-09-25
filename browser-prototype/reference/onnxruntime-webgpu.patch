@@ -2145,3 +2145,21 @@ diff --git a/onnxruntime/wasm/post-webgpu.js b/onnxruntime/wasm/post-webgpu.js
 +    return undefined;
    };
  };
+diff --git a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
+index 5658cca..4d8cf38 100644
+--- a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
++++ b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
+@@ -473,7 +473,12 @@ Status ReduceKernel<allow_multi_axes>::ComputeInternal(ComputeContext& context)
+       ORT_RETURN_IF_ERROR(context.RunProgram(transpose_program));
+       input_tensor = &input_transpose;
+     }
+-    auto workgroup_size = output_size == 1 ? static_cast<uint32_t>(256) : static_cast<uint32_t>(WORKGROUP_SIZE);
++    // Batched-int4 fork: one workgroup size for every output size (stock uses
++    // 256 threads for a single output). A global layer's value norm reduces one
++    // row of 512 per token, so a one-token step (one output) and a k-token verify
++    // pass (k outputs) summed the same row in different orders (lowmem C1,
++    // scripts/lowmem-batchinv.html).
++    auto workgroup_size = static_cast<uint32_t>(WORKGROUP_SIZE);
+     ReduceSharedProgram program(name_, reduce_op_type, workgroup_size);
+     program.CacheHint(keepdims_,
+                       noop_with_empty_axes_,

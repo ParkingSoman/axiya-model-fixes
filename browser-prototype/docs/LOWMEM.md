@@ -289,12 +289,56 @@ So at long contexts the GPU sums depend on the number of rows in a pass (the
 Phase 6 bit-identity was measured on shorter pages). A near tie smaller than
 about 0.4 can flip, which explains the different words on the long page.
 
-Fix (implemented, `speculativeGenerate` option `nearTie`): a verify row whose
-top two logits are closer than ε decides nothing; the pass stops there and a
-one-token step (the path greedy takes) decides that token. ε = 1.0, about 2.4x
-the largest measured difference. This is an empirical margin, not a proof: the
-KV entries written by multi-row passes can also differ slightly. The C1 pass
-rule (3 speculative runs identical to greedy on the gate pages) stays the test.
+First fix tried: a near-tie guard (`speculativeGenerate` option `nearTie`, ε =
+1.0). A verify row whose top two logits are closer than ε decides nothing, and a
+one-token step decides that token. It was not enough. With the guard, MTP runs
+still differed from greedy (openstax at token 1,071, the long page at token
+119). The per-pass trace (`SPEC_TRACE=1`) shows why: at both points the guard
+stopped the pass, and then the one-token step picked another token than greedy,
+at a gap of 0.031. The one-token step is not the greedy path, because earlier
+multi-row passes had written slightly different cache entries.
+
+### The cause: two kernels whose sums depended on the pass size
+
+A tiny-graph test (`scripts/lowmem-batchinv.html`, graph from
+`tools/lowmem/make_attn_graph.py`) runs one layer's attention core as a k-token
+verify pass and as the one-token steps greedy takes. It compares each token's
+rows bit for bit. 84 attention cases (sliding and global shapes, stable length
+1,101 to 3,000, recent length 0 to 50, k = 2 to 8) and 8 value-norm cases.
+
+| Kernel (ORT fork) | What depended on the pass size | Fix |
+|---|---|---|
+| `SplitMaskedSoftmax` | The vector width (1, 2 or 4) came from the row length. A verify pass has more (masked) columns than a one-token step, so a row's sums were grouped differently. | Always scalar columns. Thread i sums columns i, i + 64, ... Masked extra columns add exactly 0. |
+| `ReduceMean` (shared path) | 256 threads for one output, 64 for more. A global layer's value norm is one row of 512 per token, so a one-token step had one output. | Always 64 threads. |
+
+| Build | Attention cases identical | Value-norm cases identical |
+|---|---|---|
+| `ort-fork-dist-pm-a` (before) | 13 of 84 | 6 of 8 |
+| `ort-fork-dist-binv` (after) | 84 of 84 | 8 of 8 |
+
+The recent-part MatMuls also change their program with the column count
+(vec4 or not). The test shows that their per-row results do not change.
+The norms (`RMSNormalization`, `SkipSimplifiedLayerNormalization`) and
+`MatMulNBits` were already made pass-size independent in the fork.
+
+Both fixes are in `reference/onnxruntime-webgpu.patch`. The fork source is at
+`BlinkFix-models/tmp-g12/ort-fork-src`, and the new dist is
+`BlinkFix-models/ort-fork-dist-binv` (JSPI and asyncify rebuilt).
+
+### Decode check with the fixed build [Mac]
+
+Greedy and MTP (guard on) on the two pages that differed, 1,080 tokens each:
+
+| Page | MTP vs greedy, old build | MTP vs greedy, fixed build |
+|---|---|---|
+| openstax | differs at 1,071 | identical (1,080) |
+| long page | differs at 119 | identical (1,080) |
+
+The fixed build changes greedy's rounding, so greedy output can change at near
+ties. On the long page the first token changed ("# MALAY STATES" became "MALAY
+STATES"). Its top-2 gap under the new build is 0.25, so it is a near tie. The
+plan counts this as exact: no weight change and no approximation of the math.
+The gate reference is re-taken with the fixed build (`gate-binv.json`).
 
 ## B3 / B4: the decoder in parts, and weights streamed through a GPU ring [Mac]
 
