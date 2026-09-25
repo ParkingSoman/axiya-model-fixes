@@ -30,7 +30,7 @@ are guesses. No Windows machine has run this build.
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
-| C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer |
+| C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer (unit tests); app run on three-pages.pdf: 3 pages in order, no errors (the run did not record page 2's backlog at the switch); cancel drops the queue |
 | C5 pause instead of restart | done | |
 
 The canonical path (default build since 2026-09-25): 30 layers streamed
@@ -487,7 +487,15 @@ openstax to 600 tokens).
 
 The band saved about 0.1 GB and the peak still grew, so another source of
 growth remains (not found). One run each; the speed difference may be noise.
+The band is also not bit-identical to the unbanded cache: the masked front
+slots add exact zeros, but they move the real slots to other columns, so the
+softmax and P·V sums group them differently (2,720 against 2,741 tokens on the
+long page). Greedy and MTP stay identical to each other with or without it.
 The app does not use the band.
+
+The vision session stays loaded (0.15 GB). Freeing it after each encode would
+cost a reload per page (0.14 to 0.34 s), and in bucket mode its freed buffers
+likely stay in ORT's cache, so the GPU footprint may not drop [E, not measured].
 
 Buffer-cache modes on the canonical path (openstax, 600 tokens): bucket
 6.66 / 6.76 GB, 13.9 tok/s (kept); simple 10.5 GB; lazyRelease 5.2 GB at rest
