@@ -40,7 +40,8 @@ the browser from the local server. Ctrl+C stops it.
 | B2 hybrid LM head | done | GPU peak -0.3 to -0.4 GB; exact re-check ~2 ms a token; app build flag `VITE_LM_HYBRID=1` |
 | B3 decoder in parts | done (experiment) | no per-boundary cost once warmed (`docs/LOWMEM-STREAM.md`; code on branch `lowmem/stream-canonical`, not merged) |
 | B4 single fallback | superseded | user decision 2026-09-25: streamed layers (hc30) + MTP + hybrid head is the only path; no fallback |
-| C1 speculative = greedy | done | kernel choices independent of the pass size on every GPU (fork dist `inv`); same-cache check 4/4 pages, also on the streamed path; no runtime self-check, near-tie guard off |
+| C1 speculative = one-token decoding | done | kernel choices independent of the pass size on every GPU (fork dist `inv`); same-cache check 4/4 pages greedy, 2/2 pages sampled, also on the streamed path; no runtime self-check, near-tie guard off |
+| Decoding | done | the model's recommended sampling (user decision 2026-09-25), repeatable per output position; see the section below |
 | C2 MTP drafter | done | app build flag `VITE_SPECULATIVE=mtp` |
 | C3 display pacer | done | 8 tok/s; text stays on its page |
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
@@ -462,6 +463,77 @@ from forks of that cache, so all start from the same bits.
 
 Speed in these runs: MTP about 20 tok/s on smoke, 24 on mathfuncs, 16.8 on
 openstax, 10.9 on the long page (greedy 11.1, 11.4, 9.4, 9.2).
+
+## Decoding: the model's recommended sampling [Mac]
+
+User decision (2026-09-25): decode with the model's own settings, not greedy.
+
+| Setting | Value | Source |
+|---|---|---|
+| temperature | 1.0 | `generation_config.json` |
+| top_k | 64 | `generation_config.json` |
+| top_p | 0.95 | `generation_config.json` |
+| soft cap | 30 | `config.json` (`final_logit_softcapping`) |
+| seed | 0 | engine |
+
+Why: greedy decoding looped on page 4 of a user PDF. It wrote a footnote rule
+as `\_` without end, up to the token cap. llama.cpp loops the same way at the
+same input, and turning off the sliding trim changed nothing. This is the
+known greedy failure mode ("neural text degeneration"). With sampling, page 4
+ends by itself after 1,074 tokens and the text is correct.
+
+How it stays repeatable and exact:
+
+- Output position i draws one number `positionUniform(seed, i)`. The token at
+  a position is a fixed function of that position's logits. The same page
+  gives the same text every time (page 4: the same 1,074 token ids in two
+  runs, two sessions).
+- MTP keeps the output. A verify row and a one-token step at the same
+  position see the same logits (C1) and draw the same number.
+- The hybrid head samples the exact 8-bit logits. It stops checking rows once
+  the top-p set is certain. Bounds on the top-64 weight sum decide that. Then
+  it runs the same pick code as the full computation.
+- `sampling: null` (engine option; harness `GREEDY=1`) gives argmax. Greedy
+  references such as `gate-binv.json` need `GREEDY=1`.
+
+Same-cache check (`STEPS=specvsgreedy`, both runs sampled, streamed path,
+hybrid head, cap 600):
+
+| Page | Tokens | MTP = one-token | MTP tok/s | Head ms a token |
+|---|---|---|---|---|
+| mathfuncs | 419 (end token) | yes | 7.99 | 27 |
+| openstax | 600 (cap) | yes | 10.08 | 17 |
+
+(Head times measured before the last two head speed-ups below.)
+
+Page 4 (engine check, gate, streamed path, MTP, hybrid head):
+
+| Build | Tokens | Stop | Decode tok/s | Head time |
+|---|---|---|---|---|
+| greedy | 3,000 | cap (loop) | 13.5 | |
+| sampled, first head | 200 of a run | cap | 2.2 | 349 ms a token |
+| sampled, head stops at a certain top-p set | 1,074 | end token | 7.9 | 27.6 s |
+| sampled, heap and bound-first scans | 1,074 (same ids) | end token | 8.8 | 12.7 s |
+
+App through `npm start` (page 4 of the user PDF, `scripts/gemma12b-app-check.mjs`
+with `APP_URL=http://127.0.0.1:4173`, service workers on, Convert 20 s after
+the page opens; `evidence/lowmem/app/npmstart-sample-p4*.json`):
+
+| Run | First text after Convert | Page saved | GPU peak | Text |
+|---|---|---|---|---|
+| fresh profile (model copied first) | 74 s | 215 s | 7.07 GB | ends by itself, no loop |
+| same profile again | 7.9 s | 144 s | 6.96 GB | the same text as run 1 |
+
+The app text equals the engine check's text character for character. No
+console errors. On the second run the model is still loading when Convert is
+clicked, so page 1 is not prefetched yet (the greedy build: 5.4 s on
+mathfuncs in the same setup).
+
+Exact rows per token on page 4: 673 tokens needed 128 rows or fewer, 180
+needed up to 1,024, 159 up to 8,192, 62 more. The last group is most of the
+head time: those tokens have a wide top-p set, and the 4-bit bounds are
+loose. Speeding up the exact row itself (WASM SIMD) is the next step if the
+head matters.
 
 ## B2: the hybrid LM head [Mac]
 
