@@ -13,6 +13,20 @@ Every number says where it comes from:
 The memory margins below the Windows budget (default ≤ 7.0 GB, fallback ≤ 5.5 GB)
 are guesses. No Windows machine has run this build.
 
+## Try it locally
+
+```
+cd /Users/shonusengupta/BlinkFix/.claude/worktrees/lowmem/browser-prototype
+npm start
+```
+
+It checks the ONNX Runtime build and the model files, builds the app (the
+canonical path), serves the model files on port 4190 (or reuses a server that
+already serves them), serves the app on port 4173 and opens Chrome. An earlier
+`npm start` is replaced; a program that is not ours on 4173 is left alone and
+the app uses the next free port. The first load copies the model (8.3 GB) into
+the browser from the local server. Ctrl+C stops it.
+
 ## Status (2026-09-25)
 
 | Stage | Status | Where it stands |
