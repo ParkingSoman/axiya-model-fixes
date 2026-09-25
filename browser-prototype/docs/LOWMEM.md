@@ -328,3 +328,28 @@ each, 246 MB a token), layers 2-23 and 24-47 resident, budget 1120, greedy.
   lookup, part 3 for the LM head), so its GPU peak (10.85 GB) is not a memory
   result. The real build must share one copy (a graph input fed from one GPU
   buffer, as A3 showed) or move it to the CPU (the hybrid LM head).
+
+## C2: the MTP drafter in the app engine [Mac]
+
+`tools/gemma12b/mtp_drafter.py` builds `drafter.onnx` (263 MB, 4-bit) from the QAT
+assistant GGUF; `tools/gemma12b/mtp_drafter_check.py` checks it on the CPU against
+a numpy reference. The target runs as one part with a hidden-state output
+(`decoder.h0.onnx`, the same weights). `src/gemma12b/mtp-drafter.js` drafts from the
+target's hidden row and its layer 46/47 cache; the embedding row of each drafted
+token is read on the CPU from the cached decoder shard. The near-tie guard is on
+(ε = 1.0). Build: `VITE_SPECULATIVE=mtp`.
+
+Engine check `STEPS=spec SPEC_DRAFTER=mtp` (`evidence/lowmem/c2-mtp.json`), budget
+1120, PNG pages, greedy then speculative in one session:
+
+| Page | Same ids as greedy | Tokens per target pass | Drafts accepted | Decode, MTP | Decode, greedy | Near-tie stops |
+|---|---|---|---|---|---|---|
+| mathfuncs (first page of the session) | IDENTICAL 423/423 | 3.92 | 73% | 2.8 tok/s | 9.7 tok/s | 22 of 108 passes |
+| openstax (second page) | IDENTICAL 1,183/1,183 | 4.08 | 66% | **14.1 tok/s** | 7.7 tok/s | 41 of 290 passes |
+
+- On mathfuncs the first verify passes of each new row count took about 2 s
+  (shader compilation). On the second page every shape was compiled: 1.8x.
+- A draft step costs about 27 ms (38.7 s for 1,409 drafts on openstax). The
+  target pass costs 105 ms with 1 row and 390 ms with 9 rows on this GPU.
+- Next: compile the verify shapes at load; find the draft step's cost; check how
+  often the near-tie guard stops a pass.
