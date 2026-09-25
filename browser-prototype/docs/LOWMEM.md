@@ -351,5 +351,18 @@ Engine check `STEPS=spec SPEC_DRAFTER=mtp` (`evidence/lowmem/c2-mtp.json`), budg
   (shader compilation). On the second page every shape was compiled: 1.8x.
 - A draft step costs about 27 ms (38.7 s for 1,409 drafts on openstax). The
   target pass costs 105 ms with 1 row and 390 ms with 9 rows on this GPU.
-- Next: compile the verify shapes at load; find the draft step's cost; check how
-  often the near-tie guard stops a pass.
+- Rerun with the verify shapes compiled at load (`engine.loadStats.warmUp`: 8
+  shapes and one drafter step, 1.6 s), `evidence/lowmem/c2-mtp-warm.json`:
+
+  | Page | Same ids as greedy | MTP | Greedy | Speed-up | Draft step | Near-tie stops |
+  |---|---|---|---|---|---|---|
+  | mathfuncs | IDENTICAL 423/423 | 18.4 tok/s | 11.1 tok/s | 1.66x | 19.8 ms (0.7 embedding read) | 22 of 108 |
+  | openstax | IDENTICAL 1,183/1,183 | 13.8 tok/s | 7.7 tok/s | 1.79x | 25.5 ms (2.8 embedding read) | 41 of 290 |
+
+- The draft step is mostly the drafter session's run (per-run overhead; its
+  weights are only 0.27 GB). On a bandwidth-bound laptop GPU the target pass
+  dominates, so this matters less there. Estimate for Iris Xe: target pass about
+  220 ms, 4 draft steps about 60 ms, about 3.9 tokens a pass: about 14 tok/s [E].
+- Ideas to cut the draft step later: run all k draft steps in one session call
+  (needs the target's token table as a shared GPU input); fewer near-tie stops
+  with a smaller ε (the largest measured difference was 0.41).
