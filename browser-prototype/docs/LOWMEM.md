@@ -340,6 +340,85 @@ STATES"). Its top-2 gap under the new build is 0.25, so it is a near tie. The
 plan counts this as exact: no weight change and no approximation of the math.
 The gate reference is re-taken with the fixed build (`gate-binv.json`).
 
+### A third cause: results depend on the session's history [Mac]
+
+The 3-run check across processes still failed on mathfuncs (index 351, all 3
+runs). Probes (all in `scripts/gemma12b-engine-check.mjs`):
+
+| Probe | Result |
+|---|---|
+| `rowcheck`: one row as a 1-row step, as row 3 of a 9-row pass, and after a rollback | bit-identical (0 differing logits at 3 positions) |
+| `draftercheck`: cache before and after 3 MTP draft plans | 0 of 192 tensors changed |
+| `prefixcheck`: kept prefix before and after page runs | unchanged; repeated greedy runs identical |
+| `repeat`: image features and prefill logits, same page twice in one session | identical |
+| the same, across processes with different loads | features differ |
+| vision graph alone (`lowmem-visioncheck.html`), cold, warm, after other GPU work | identical |
+
+Features across two loads (with and without the load's warm-up): 0.08% of
+values differ, by at most 0.031 (1 to 2 float16 steps). This carries into the
+prefill logits (up to 0.75). With no buffer reuse at all (`BUFFER_CACHE=
+storage=lazyRelease,uniform=lazyRelease,default=lazyRelease`) it still happens,
+so stale memory is not the cause. The vision graph alone is deterministic, so
+the effect needs the full engine's history. The kernel is not found yet
+(open item). It is rounding-level, which the plan counts as exact, but it makes
+comparisons between processes unfair.
+
+### C1 result: MTP vs greedy from one cache [Mac]
+
+`STEPS=specvsgreedy`: the page is prefilled once; greedy and each MTP run decode
+from forks of that cache, so all start from the same bits.
+
+| Page | Greedy tokens | MTP runs (guard on) | Guard off |
+|---|---|---|---|
+| smoke | 25 | 3 of 3 identical | |
+| mathfuncs | 352 | 3 of 3 identical | |
+| openstax | 1,173 | 3 of 3 identical | |
+| long page (to 1,500 tokens) | 1,500 | 3 of 3 identical | identical |
+
+Speed in these runs: MTP about 20 tok/s on smoke, 24 on mathfuncs, 16.8 on
+openstax, 10.9 on the long page (greedy 11.1, 11.4, 9.4, 9.2).
+
+## B2: the hybrid LM head [Mac]
+
+`decoder.hb.onnx` + `lmhead.json`, engine option `lmHybrid`, worker build flag
+`VITE_LM_HYBRID=1` (the 8-bit table is copied once into OPFS and read by row).
+
+| Page | GPU peak, GPU head | GPU peak, hybrid | Greedy tok/s, GPU head | hybrid |
+|---|---|---|---|---|
+| smoke | 9.52 GB | 9.22 GB | 11.4 | 10.2 |
+| mathfuncs | 9.73 GB | 9.32 GB | 11.1 | 9.3 |
+| openstax | 9.73 GB | 9.42 GB | 8.6 | 8.0 |
+| long page | 9.73 GB | 9.42 GB | 8.4 | 8.0 |
+
+(Speeds measured before the re-check was made faster: it cost 6 to 9 ms a
+token then, about 2 ms now.)
+
+- Hybrid greedy differs from GPU-head greedy at mathfuncs index 351 (hybrid
+  gap 1.5) and long page index 279 (gap 0.013). The re-check works in float64 on
+  the same 8-bit weights; the GPU head computes its dot products in float16
+  (fork comment in `matmul_nbits.cc`). Both are the same math, rounded
+  differently.
+- MTP on the hybrid head is identical to hybrid greedy (same-cache check,
+  mathfuncs and openstax, guard on and off).
+- With MTP the guard asks for a gap on every verify row. An exact gap cost ~327
+  exact rows a call; the guard now reads a lower bound instead (`boundOnly`):
+  ~64 rows, ~2 ms a call. A stop only defers the token to an exact one-row step.
+
+## App run: MTP + hybrid head [Mac]
+
+`VITE_SPECULATIVE=mtp VITE_LM_HYBRID=1` build, `CONVERT_AT_MS=30000`
+(evidence/lowmem/app/). Run before the bound-only guard.
+
+| Page | Tokens | Decode tok/s | First text after Convert | GPU peak |
+|---|---|---|---|---|
+| smoke | 25 (eos) | 12.0 | | 9.42 GB |
+| mathfuncs | 352 (eos) | 16.4 | 10.7 s | 9.63 GB |
+
+- The re-check took 5.8 s of mathfuncs' 21.5 s decode (fixed since, above).
+- First text came 10.7 s after Convert: the page-1 prefill did not help in
+  this run. Not investigated yet (the harness may choose the file only at
+  Convert time).
+
 ## B3 / B4: the decoder in parts, and weights streamed through a GPU ring [Mac]
 
 `tools/gemma12b/split_decoder.py` cuts `decoder.onnx` into consecutive layer-group
