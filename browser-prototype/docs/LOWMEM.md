@@ -47,6 +47,7 @@ the browser from the local server. Ctrl+C stops it.
 | C4 page 1 before Convert | done | first text about 1.5 s after Convert; Convert reuses the prefetch's page-1 render |
 | C4 lookahead (next page while reading) | done | display-side page queue (user decision): page events wait behind their text in the pacer, and the editor keeps a page live until its page-complete reaches the display. App, three-pages.pdf: page 2 saved at 41.5 s, its live text still grew to 1,087 characters at 55.9 s while page 3 decoded; cancel drops the queue |
 | C5 pause instead of restart | done | |
+| Live edit (branch `lowmem/live-edit`) | done | math and closed figures editable while streaming; each math item checked by MathJax as it closes, a flagged one repaired mid-page; WCAG figure rules (about +0.3 GB GPU peak: mathfuncs app 7.17 GB, 8.78 tok/s). See `docs/LIVE-EDIT.md` |
 
 The canonical path (default build since 2026-09-25): 30 layers streamed
 (layout `hc30`), MTP, hybrid LM head.
