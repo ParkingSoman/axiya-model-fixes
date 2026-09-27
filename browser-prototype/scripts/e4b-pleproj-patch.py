@@ -1,6 +1,6 @@
 """Make a copy of a Gemma 4 E2B/E4B QAT GGUF with per_layer_model_proj.weight scaled.
 
-Why: in Google's QAT checkpoints (E4B and E2B) this F16 tensor is about 64x smaller
+Why: in Google's QAT checkpoints this tensor is about 64x (E4B) or 54x (E2B) smaller
 than in the base checkpoint (E4B RMS 0.000384 vs 0.02476). The runtime multiplies its
 output by hidden_size**-0.5 and applies an RMSNorm with eps 1e-6. With the QAT weights
 the mean square before that norm is about 1e-6, so the eps shrinks the per-layer
