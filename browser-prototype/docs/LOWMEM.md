@@ -77,7 +77,7 @@ fixed fork build (`gate-binv.json`).
 | Item | Value |
 |---|---|
 | Model package | `/Users/shonusengupta/BlinkFix-models/gemma-12b-q4/` (`decoder.onnx` `a6c6f4ea…`, the fix2 trim graph) |
-| Fork dist | `ort-fork-dist-inv` (before: `binv`, `pm-a`), copied to `.local/ort-fork-dist`; pinned by `reference/ort-fork-dist.json` |
+| Fork dist | `ort-fork-dist-inv` (before: `binv`, `pm-a`), its 4 served files in `reference/ort-fork-dist/` (in git since 2026-09-27); pinned by `reference/ort-fork-dist.json` |
 | Browser profile (model cached) | `agent-a1a20012219348d7d/browser-prototype/evidence/gemma12b-profile` |
 | Degraded scans | `evidence/lowmem/scans/` (made by `make_scans.py` there): openstax and mathfuncs page 1, 150 DPI, grey, 1.3° and −1.8° skew, blur, noise, specks, JPEG q45, image-only PDF |
 | Unit tests | 895 tests, 884 pass, 9 known failures (the baseline) |
