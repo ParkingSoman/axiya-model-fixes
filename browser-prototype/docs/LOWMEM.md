@@ -727,3 +727,61 @@ Checks on the M5 (`evidence/gpu-neutral/`):
 Longest single dispatch on the M5: E2B vision flash attention, about 137 ms
 (16 per page). The Surface check (`gpu-check.html`) records it there.
 
+
+## Windows GPU: hang, lag and garbage on an Intel gen-9 laptop (2026-09-28)
+
+Plan: `~/.claude/plans/so-i-tried-concurrent-wind.md`. Test machine: the user's
+HP laptop (Intel gen-9 integrated GPU, 16 GB, Chrome 154, D3D12), driven from
+the Mac with Claude in Chrome over a Cloudflare tunnel (memory
+`windows-hp-harness`). Evidence: `evidence/windows-hp/`, `evidence/f16-read/`.
+
+### Tools
+
+| Tool | What it does |
+|---|---|
+| `?gpuTrace=1` (`src/gpu-trace.js`) | Times every GPU submit in the model worker; logs long submits, GPU loss with the submits in flight, and run counts. `?gpuTracePost=1` sends the lines to `npm start`'s collector (`scripts/gpu-trace-collector.mjs`). |
+| `?gpuProfile=1` / `=decode` | ORT profiler: every dispatch of a session's first long run, or per-program GPU time up to the 20th decode step. |
+| `gpu-check.html?imageBudget=280` | The GPU check at a small page image, so a slow GPU stays under the Windows 2 s limit. Reference `src/gpu-check/ref-e2b-280.json` (M5). The verdict now reads the real fields (it said "matches" for every run before). |
+| `gpu-check.html?taps=1` | Small's vision graph with every layer-0 op and every attention/norm output as an extra output (`tools/gpu-debug/vision_taps.py`); `tools/gpu-debug/compare_taps.py` compares two machines op by op. |
+| `tools/gpu-debug/f16-store-test.html` | 19 tiny WGSL kernels: which ways of storing or loading f16 lose values on this GPU. |
+
+`?gpuSubmit=N` cannot reach ORT: ORT web builds the WebGPU context from the EP
+options before it reads session config, and has no option for
+`maxNumPendingDispatches`. Every run above used 16 dispatches per submit.
+
+### Garbage text: odd f16 elements read as 0
+
+On the HP, Small wrote random words in many scripts. The Mac wrote the page.
+
+| Step | Result |
+|---|---|
+| Vision taps, HP vs M5 | first wrong op: patch embedder position `Gather_22/23`; every odd f16 column read as 0 (243 of 384; the rest are 0 in the table). `MatMul_7` bit-exact. |
+| `f16-store-test` | stores exact; picking one element out of a 16-bit storage load (scalar, vec2/vec4 with an index, or `.y`) gives 0 for odd elements; whole-vector use, workgroup staging, and u32 loads + `bitcast` are exact. |
+| Fix (fork branch `gpu-f16-read`, ee2ba08) | scalar f16 inputs are `array<u32>`; every f16 getter bitcasts a 32-bit value (`shader_variable.cc PackedF16Get`); `Where`'s broadcast path reads through the getters. Every GPU runs these programs. `build-ort-fork.sh` refuses a patch without it (F16R). |
+
+| Check | Result |
+|---|---|
+| HP `gpu-check.html?imageBudget=280` | before: vision cosine median 0.45, 0/8 top-1; after: 0.999996, 8/8, "matches the Mac" |
+| HP app, Small at 560 | writes the page (same kind of sampling slips as the M5 at 560) |
+| M5 vision taps, new vs old fork | 141/141 bit-identical |
+| M5 `lowmem-batchinv.html?model=e4b` / 12B | 528/528, 92/92 |
+| M5 gpu-check at 280 vs the old-fork reference | 8/8 top-1; probability difference ≤ 0.009 (last-bit rounding in a few decoder kernels) |
+| M5 GPU time, same work (`?gpuProfile=decode`) | decoder +2.3%, drafter +4.2%; small scalar-read kernels slower (Cast x1.45, Concat x2.4, Tile x2.2) |
+
+No public report of this bug was found (onnxruntime #29807 and #24442 report
+wrong output on Intel GPUs without a cause).
+
+### Hang and lag: GPU submits too long for a slow GPU
+
+| Run (HP, Small) | Result |
+|---|---|
+| imageBudget 1120 | `DXGI_ERROR_DEVICE_HUNG` in vision: one 16-dispatch submit with the flash-attention dispatch ran over 4.5 s. Chrome then gave no WebGPU adapter to any site until it restarted. |
+| imageBudget 560 | no loss; the 16 vision submits took 1.46-1.90 s each (under the 2 s limit) |
+
+HP/M5 time per program (Small at 280, profiled, matched dispatch by
+dispatch): vision flash attention K 48 (367 ms vs 7.7 ms), vision fp16 MatMul
+20, prefill fp16 MatMul 17, `MatMulNBitsWideTile` 5-7. At 1120 one
+attention dispatch (M5 ~137 ms) takes about 6.6 s on the HP.
+
+The page's frame-gap probe (rAF) saw 18 ms gaps while 400 ms GPU submits ran,
+so it cannot see this lag; screenshots of the HP are the evidence instead.
