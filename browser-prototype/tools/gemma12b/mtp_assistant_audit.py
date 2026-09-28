@@ -12,13 +12,14 @@ looks for the same fault in an assistant checkpoint:
    target GGUF) and the target's scaled token embeddings of the next ids. For every RMSNorm
    it records the mean square of its input. gain = sqrt(ms / (ms + eps)) is the factor the
    eps takes off. The defect in the main checkpoint showed gain 0.37 on image tokens. A healthy
-   norm has gain 1.0000. K/V: random with the target's layer 22/23 key-norm scale (values unit
-   RMS, as v_norm gives); they only reach the norms through o_proj.
+   norm has gain 1.0000. K/V: random with the key-norm scale of the target's last own-cache
+   sliding / global layer (--kv-layers, E4B 22,23, E2B 13,14; values unit RMS, as v_norm
+   gives); they only reach the norms through o_proj.
 3. Lattice: the Q4_0 GGUF against the QAT bf16 weights (relative error per tensor). QAT
    weights sit on the Q4_0 grid, so llama-quantize Q4_0 should be exact or nearly so.
 
   python mtp_assistant_audit.py --qat DIR --base DIR --target-gguf F --hidden H.npy --ids I.npy \
-      [--q4 assistant-q4_0.gguf] [--json out.json]
+      [--kv-layers 22,23] [--q4 assistant-q4_0.gguf] [--json out.json]
 """
 from __future__ import annotations
 
@@ -96,6 +97,7 @@ def main():
     ap.add_argument('--hidden', type=Path, required=True)
     ap.add_argument('--ids', type=Path, required=True)
     ap.add_argument('--q4', type=Path)
+    ap.add_argument('--kv-layers', default='22,23', help='target sliding,global layer the drafter reads (E4B 22,23; E2B 13,14)')
     ap.add_argument('--json', type=Path)
     args = ap.parse_args()
     import gguf
@@ -121,7 +123,7 @@ def main():
     D = hid.shape[1]
     emb = np.stack([table[int(r)] for r in ids[1:n + 1]]) * np.float32(np.sqrt(D))
     kn = {kind: gguf.quants.dequantize(np.asarray(tg[f'blk.{L}.attn_k_norm.weight'].data), tg[f'blk.{L}.attn_k_norm.weight'].tensor_type).reshape(-1)
-          for kind, L in (('sliding', 22), ('global', 23))}
+          for kind, L in zip(('sliding', 'global'), (int(x) for x in args.kv_layers.split(',')))}
     report['inputs'] = {'rows': int(n), 'hidden_rms_median': float(np.median(rms_rows(hid[:n]))), 'embed_rms_median': float(np.median(rms_rows(emb)))}
     ys = {}
     for name, W in (('qat', Wq), ('base', Wb)):
