@@ -407,8 +407,8 @@ elementwise ops and rotary do not depend on the row count.
 Checks on this Mac with `ort-fork-dist-inv`: 320 of 320 attention cases
 identical; MTP equal to greedy from one cache on mathfuncs (420 tokens) and
 openstax (600), with the near-tie guard on and off. The Intel and subgroup-matrix
-paths cannot run on this Mac: there the fix holds by construction (the same
-program for every pass size), not by a hardware test. The load-time self-check
+paths could not run on this Mac. Since 2026-09-28 they are gone: see
+"GPU-neutral kernels" below. The load-time self-check
 was removed (user decision), and the near-tie guard is off by default (it only
 cost speed: mathfuncs 10.9 against 12.5 tok/s).
 
@@ -686,3 +686,44 @@ Engine check `STEPS=spec SPEC_DRAFTER=mtp` (`evidence/lowmem/c2-mtp.json`), budg
 - Ideas to cut the draft step later: run all k draft steps in one session call
   (needs the target's token table as a shared GPU input); fewer near-tie stops
   with a smaller ε (the largest measured difference was 0.41).
+
+## GPU-neutral kernels (2026-09-28)
+
+A Surface Laptop 7 (Windows, Qualcomm Adreno) wrote garbage from the first
+character with Small, and froze. The fork let kernels pick programs by GPU
+brand and subgroup width, so that laptop ran programs no Mac had run:
+
+| Kernel | Apple | Qualcomm (before) |
+|---|---|---|
+| Flash attention (E-model vision) | shared-memory path, 128-lane prefill tile | subgroup path, Qualcomm output tile, 64-lane tile |
+| Wide-tile MatMulNBits (prefill) | `subgroupShuffle`, min size 32 | `subgroupShuffle`, min size 64 |
+| MatMul above 256 rows | generic | generic (Intel: Intel program) |
+
+The fork (tree `~/BlinkFix-models/tmp-g12/ort-fork-src`, branch `gpu-neutral`,
+commit 7fab419) now:
+
+- gives kernels an empty adapter info (`WebGpuContext::AdapterInfo()` returns
+  `kernel_adapter_info_`),
+- creates the device without `Subgroups`, `SubgroupSizeControl` and
+  subgroup-matrix, so every kernel takes its non-subgroup branch,
+- clamps the limits kernels choose from to the WebGPU defaults
+  (`GpuNeutralLimits`: 16384 B workgroup storage, 8 storage buffers, 256
+  invocations).
+
+`scripts/build-ort-fork.sh` refuses a reference patch that loses any of this
+(check GN). Bits can still differ in the last places between GPU compilers
+(Metal uses relaxed math); that changes a token only at a near tie.
+
+Checks on the M5 (`evidence/gpu-neutral/`):
+
+| Check | Old dist | Neutral dist |
+|---|---|---|
+| `lowmem-batchinv.html?model=e4b` | 528 / 528 | 528 / 528 |
+| `lowmem-batchinv.html` (12B attention) | 92 / 92 | 92 / 92 |
+| E4B vision + decoder vs CPU reference, 8 positions | 8 / 8 top-1 | same logits, bit for bit |
+| E4B prefill / decode step | 5.9-6.3 s / 36-38 ms | 6.0-6.1 s / 36-37 ms |
+| App, handwritten 2-page PDF | - | Small, Medium, Large all readable |
+
+Longest single dispatch on the M5: E2B vision flash attention, about 137 ms
+(16 per page). The Surface check (`gpu-check.html`) records it there.
+

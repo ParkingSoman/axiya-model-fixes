@@ -42,6 +42,11 @@
 #     pool behind staging buffers; before, it kept about 1 GB in the GPU
 #     process after the Gemma 4 12B load, and the loader's JavaScript scratch
 #     buffer kept the size of the largest initializer (1 GB).
+#   - GPU-neutral kernels (GN): kernels see an empty adapter info (no GPU
+#     brand, architecture or subgroup width), the device has no subgroup
+#     features, and the limits kernels choose from are the WebGPU defaults,
+#     so every GPU runs the same programs (docs/LOWMEM.md "GPU-neutral
+#     kernels"). The patch also carries the E4B/E2B fp32 accumulation.
 #
 #   ORT_SRC=/path/to/ort-fork  PATCH=1  OUT=/path/to/out  scripts/build-ort-fork.sh
 #
