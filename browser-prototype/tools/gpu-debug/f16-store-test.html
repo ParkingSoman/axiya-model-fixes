@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>f16 store test</title>
+<!-- Windows GPU plan: does this GPU keep every 16-bit value that a WGSL
+     program stores or loads? Four kernels on 4096 f16 values:
+       K1  invocation i stores out[i] = f16(i)                (scalar f16 store)
+       K2  invocation i stores one vec2<f16> (elements 2i, 2i+1)
+       K3  one invocation stores all 4096 scalars in a loop    (store, no neighbour)
+       K4  invocation i loads a scalar f16 and stores f32      (scalar f16 load)
+     Serve it next to a local server with scripts/gpu-trace-collector.mjs;
+     ?post=1 sends the result as one F16TEST line. -->
+<pre id="out">running…</pre>
+<script type="module" src="f16-store-test.js"></script>
