@@ -2528,6 +2528,122 @@ index 5658cca..4d8cf38 100644
      ReduceSharedProgram program(name_, reduce_op_type, workgroup_size);
      program.CacheHint(keepdims_,
                        noop_with_empty_axes_,
+diff --git a/onnxruntime/core/providers/webgpu/shader_helper.cc b/onnxruntime/core/providers/webgpu/shader_helper.cc
+index c69994c..25675dd 100644
+--- a/onnxruntime/core/providers/webgpu/shader_helper.cc
++++ b/onnxruntime/core/providers/webgpu/shader_helper.cc
+@@ -325,6 +325,10 @@ ShaderVariableHelper& ShaderHelper::AddVariableImpl(bool is_input,
+   }
+ 
+   const auto& var = vars.emplace_back(std::make_unique<ShaderVariableHelper>(name, type, usage, dims, segments, limits_.maxStorageBufferBindingSize));
++  // gpu-f16-read: float16 inputs are read as 32-bit words (shader_variable.h).
++  var->packed_f16_input_ = is_input && (type == ProgramVariableDataType::Float16 ||
++                                        type == ProgramVariableDataType::Float16x2 ||
++                                        type == ProgramVariableDataType::Float16x4);
+   return *var;
+ }
+ 
+diff --git a/onnxruntime/core/providers/webgpu/shader_variable.cc b/onnxruntime/core/providers/webgpu/shader_variable.cc
+index f41dcee..afbbed3 100644
+--- a/onnxruntime/core/providers/webgpu/shader_variable.cc
++++ b/onnxruntime/core/providers/webgpu/shader_variable.cc
+@@ -129,6 +129,22 @@ inline std::string GetIndicesType(int rank) {
+                                : MakeStringWithClassicLocale("array<u32, ", rank, ">"));
+ }
+ 
++// gpu-f16-read: the f16 value at element `offset` of a float16 input stored
++// as 32-bit words (`buf` is the array name).
++// Scalar inputs are stored as u32 words (two f16 each). Vector inputs keep
++// their vec2<f16>/vec4<f16> storage, so a kernel's own raw loads still type
++// check; the getter reads them through a 32-bit bitcast round trip, which is
++// exact on that GPU too.
++std::string PackedF16Get(ProgramVariableDataType type, std::string_view buf, std::string_view offset) {
++  switch (type) {
++    case ProgramVariableDataType::Float16:
++      return MakeStringWithClassicLocale("bitcast<vec2<f16>>(", buf, "[(", offset, ") >> 1u])[(", offset, ") & 1u]");
++    case ProgramVariableDataType::Float16x2:
++      return MakeStringWithClassicLocale("bitcast<vec2<f16>>(bitcast<u32>(", buf, "[", offset, "]))");
++    default:
++      return MakeStringWithClassicLocale("bitcast<vec4<f16>>(bitcast<vec2<u32>>(", buf, "[", offset, "]))");
++  }
++}
+ }  // namespace
+ 
+ ShaderIndicesHelper::ShaderIndicesHelper(std::string_view name, ProgramVariableDataType type, ShaderUsage usage, const TensorShape& dims)
+@@ -317,7 +333,9 @@ void ShaderVariableHelper::Impl(OStringStream& ss) const {
+     // Returns the WGSL return expression for a given buffer name, mirroring GetByOffsetImpl.
+     auto make_get_return_expr = [&](std::string_view buf) -> std::string {
+       SS(expr, 128);
+-      if (is_64bit) {
++      if (packed_f16_input_) {
++        expr << PackedF16Get(type_, buf, "local_offset");
++      } else if (is_64bit) {
+         expr << ElementType() << "(" << buf << "[local_offset].x)";
+       } else if (is_boolx4) {
+         expr << "vec4<bool>(bool(" << buf << "[local_offset] & 0xFFu), bool(" << buf
+@@ -404,6 +422,9 @@ std::string ShaderVariableHelper::GetByOffsetImpl(std::string_view offset, bool
+     ss << "get_" << name_ << "_by_offset(" << offset << ")";
+     return SS_GET(ss);
+   }
++  if (packed_f16_input_) {
++    return PackedF16Get(type_, name_, offset);
++  }
+   switch (type_) {
+     case onnxruntime::webgpu::ProgramVariableDataType::InvalidType:
+       ORT_THROW("Invalid type");
+@@ -488,9 +509,13 @@ std::string ShaderVariableHelper::SetByOffsetImpl(std::string_view offset, std::
+ }
+ 
+ std::string_view ShaderVariableHelper::StorageType() const {
++  if (packed_f16_input_ && type_ == ProgramVariableDataType::Float16) {
++    return "u32";
++  }
+   return STORAGE_TYPE[static_cast<int>(type_)];
+ }
+ 
++
+ std::string_view ShaderVariableHelper::ValueType() const {
+   return (usage_ & ShaderUsage::UseValueTypeAlias) ? value_type_alias_ : VALUE_TYPE[static_cast<int>(type_)];
+ }
+diff --git a/onnxruntime/core/providers/webgpu/shader_variable.h b/onnxruntime/core/providers/webgpu/shader_variable.h
+index 0cf0a5b..9edcd58 100644
+--- a/onnxruntime/core/providers/webgpu/shader_variable.h
++++ b/onnxruntime/core/providers/webgpu/shader_variable.h
+@@ -213,6 +213,13 @@ class ShaderVariableHelper : public ShaderIndicesHelper {
+ 
+   uint32_t segments_ = 1;
+   uint64_t max_storage_buffer_binding_size_ = 0;
++  // gpu-f16-read: a float16 input is read through 32-bit words: a scalar
++  // input is declared array<u32>, and every f16 getter bitcasts a 32-bit
++  // value back to f16 (shader_variable.cc PackedF16Get). Every GPU runs this
++  // program. Intel gen-9 on D3D12 (Chrome 154) returns 0 for the odd element
++  // when a kernel picks one f16 out of a 16-bit storage load; a bitcast from
++  // a 32-bit load is exact there (evidence/windows-hp, f16-store-test).
++  bool packed_f16_input_ = false;
+ 
+   friend class ShaderHelper;
+ };
+diff --git a/onnxruntime/core/providers/webgpu/tensor/where.cc b/onnxruntime/core/providers/webgpu/tensor/where.cc
+index 8bb53e4..a608ba1 100644
+--- a/onnxruntime/core/providers/webgpu/tensor/where.cc
++++ b/onnxruntime/core/providers/webgpu/tensor/where.cc
+@@ -103,11 +103,13 @@ Status WhereProgram::GenerateShaderCode(ShaderHelper& shader) const {
+     const auto& output_indices = shader.AddIndices("output_indices");
+ 
+     const auto single_assignment =
+-        [&expression, &shader, &output_indices, &a_indices, &b_indices, &c_indices](
++        [&expression, &shader, &output_indices, &a_indices, &b_indices, &c_indices, &a_input, &b_input](
+             std::string_view rest_str, const std::string& x, std::string_view type_cast = "")
+         -> void {
+-      const std::string a_expression = "a_data[index_a" + x + "][component_a" + x + "]";
+-      const std::string b_expression = "b_data[index_b" + x + "][component_b" + x + "]";
++      // gpu-f16-read: read through the getters (a 32-bit bitcast for f16), never
++      // pick one element straight out of a raw 16-bit vector load.
++      const std::string a_expression = a_input.GetByOffset("index_a" + x) + "[component_a" + x + "]";
++      const std::string b_expression = b_input.GetByOffset("index_b" + x) + "[component_b" + x + "]";
+       const std::string c_expression = "bool(c_data[index_c" + x + "] & (0xffu << u32(component_c" + x + " * 8)))";
+ 
+       shader.MainFunctionBody() << "let output_indices" << x << " = " << output_indices.OffsetToIndices("global_idx * 4 + " + x) << ";\n"
 diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.cc b/onnxruntime/core/providers/webgpu/webgpu_context.cc
 index ff85ff9..3e5e454 100644
 --- a/onnxruntime/core/providers/webgpu/webgpu_context.cc

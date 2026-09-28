@@ -198,6 +198,18 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     ! grep -rn -E 'GetAdapterInfo|\.GetInfo\(|(^|[^a-z_])adapter_info_' onnxruntime/contrib_ops/webgpu onnxruntime/core/providers/webgpu |
         grep -v "^$ctx\." | grep -q . || {
       echo "reference patch is not GPU-neutral (GN): a kernel can see the GPU brand, subgroups or adapter limits; refusing" >&2; exit 1; }
+  # F16R (gpu-f16-read): kernels read float16 inputs through 32-bit words.
+  # Intel gen-9 on D3D12 returns 0 for the odd element when a kernel picks one
+  # f16 out of a 16-bit storage load (docs/LOWMEM.md, Windows GPU). Scalar f16
+  # inputs are array<u32>; every f16 getter bitcasts a 32-bit value; Where's
+  # broadcast path reads through the getters.
+  sv=onnxruntime/core/providers/webgpu/shader_variable
+  grep -q 'bool packed_f16_input_ = false;' $sv.h &&
+    grep -q '^std::string PackedF16Get(ProgramVariableDataType type' $sv.cc &&
+    grep -q 'bitcast<vec4<f16>>(bitcast<vec2<u32>>(' $sv.cc &&
+    grep -q 'var->packed_f16_input_ = is_input &&' onnxruntime/core/providers/webgpu/shader_helper.cc &&
+    grep -q 'a_input.GetByOffset("index_a" + x)' onnxruntime/core/providers/webgpu/tensor/where.cc || {
+      echo "reference patch lacks the F16R float16 read path (gpu-f16-read); refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
