@@ -422,6 +422,152 @@ index 3e4c16c..a92d688 100644
  // Phase 2 scaffold: keep baseline decode programs untouched by adding paged variants.
  class FlashAttentionPagedDecodeQKVProgram final : public Program<FlashAttentionPagedDecodeQKVProgram> {
   public:
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
+index 962427b..6461a8d 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
+@@ -52,6 +52,14 @@ fn is_key_visible(k_idx: u32, local_window_start: u32, causal_end: u32) -> bool
+ }
+ 
+ alias qk_precision = f32;
++// E4B fork: the attention output is summed in f32 (o_value_t). The softmax
++// weights stay f32 (no rounding to the input type before the V product), and
++// each V value is cast to f32. The output is cast to the input type in
++// writeo. Stock ORT kept o_tile in the input type (f16) and rescaled it for
++// every key step: over ~10k keys that lost 6-11% relL2 per layer. The
++// Qualcomm path keeps half of o_tile in workgroup memory and stays f16
++// (an f32 copy would double that workgroup memory).
++alias o_value_t = vec4<f32>;
+ const qk_min_value = qk_precision(-3.4028234663852886e+38f);
+ 
+ const max_k_step : u32 = max_k_step_param;
+@@ -146,12 +154,12 @@ fn loadv(v_start : u32, batch_head_idx : u32, local_idx : u32, total_seq : u32)
+ #endif
+ }
+ 
+-var<private> o_tile : array<q_value_t, head_size_vec>;
++var<private> o_tile : array<o_value_t, head_size_vec>;
+ fn writeo(batch_idx : u32, o_idx_global : u32, head_idx : u32) {
+   let offset = batch_idx * uniforms.new_sequence_length * num_heads * head_size_vec +
+                o_idx_global * num_heads * head_size_vec + head_idx * head_size_vec;
+   for (var idx : u32 = 0; idx < head_size_vec; idx++) {
+-    output[offset + idx] = o_tile[idx];
++    output[offset + idx] = q_value_t(o_tile[idx]);
+   }
+ }
+ 
+@@ -252,12 +260,12 @@ fn writeo(batch_idx : u32, o_idx_global : u32, head_idx : u32, local_idx : u32)
+   }
+ }
+  #else
+-var<private> o_tile : array<q_value_t, head_size_vec>;
++var<private> o_tile : array<o_value_t, head_size_vec>;
+ fn writeo(batch_idx : u32, o_idx_global : u32, head_idx : u32) {
+   let offset = batch_idx * uniforms.new_sequence_length * num_heads * head_size_vec +
+                o_idx_global * num_heads * head_size_vec + head_idx * head_size_vec;
+   for (var idx : u32 = 0; idx < head_size_vec; idx++) {
+-    output[offset + idx] = o_tile[idx];
++    output[offset + idx] = q_value_t(o_tile[idx]);
+   }
+ }
+  #endif
+@@ -424,14 +432,14 @@ $MAIN {
+     }
+     previous_max = new_max;
+     previous_denom = d;
+-    let o_ratio = q_element_t(dleft / d);
++    let o_ratio = f32(dleft / d);
+ 
+     for (var i : u32 = 0; i < head_size_vec; i++) {
+-      var acc = q_value_t(0);
++      var acc = o_value_t(0);
+       for (var k = 0u; k < max_k_step; k++) {
+-        acc += v_tile[k][i] * q_element_t(qk_scores[k]);
++        acc += o_value_t(v_tile[k][i]) * f32(qk_scores[k]);
+       }
+-      o_tile[i] = o_tile[i] * q_element_t(o_ratio) + acc;
++      o_tile[i] = o_tile[i] * o_ratio + acc;
+     }
+   }
+ 
+@@ -563,11 +571,15 @@ $MAIN {
+     }
+     previous_max = new_max;
+     previous_denom = d;
++ #if is_qualcomm
+     let o_ratio = q_element_t(dleft / d);
+     let qk_1_value = q_value_t(qk_1);
+     let qk_2_value = q_value_t(qk_2);
+     let qk_3_value = q_value_t(qk_3);
+     let qk_4_value = q_value_t(qk_4);
++ #else
++    let o_ratio = f32(dleft / d);
++ #endif
+ 
+  #if is_qualcomm
+     if (sg_size > 8) {
+@@ -653,22 +665,22 @@ $MAIN {
+   #else
+         var val = q_value_t(0);
+   #endif
+-        var sum = fetchVTile(0, i, val) * qk_1_value[0];
+-        sum += fetchVTile(1, i, val) * qk_1_value[1];
+-        sum += fetchVTile(2, i, val) * qk_1_value[2];
+-        sum += fetchVTile(3, i, val) * qk_1_value[3];
+-        sum += fetchVTile(4, i, val) * qk_2_value[0];
+-        sum += fetchVTile(5, i, val) * qk_2_value[1];
+-        sum += fetchVTile(6, i, val) * qk_2_value[2];
+-        sum += fetchVTile(7, i, val) * qk_2_value[3];
+-        sum += fetchVTile(8, i, val) * qk_3_value[0];
+-        sum += fetchVTile(9, i, val) * qk_3_value[1];
+-        sum += fetchVTile(10, i, val) * qk_3_value[2];
+-        sum += fetchVTile(11, i, val) * qk_3_value[3];
+-        sum += fetchVTile(12, i, val) * qk_4_value[0];
+-        sum += fetchVTile(13, i, val) * qk_4_value[1];
+-        sum += fetchVTile(14, i, val) * qk_4_value[2];
+-        sum += fetchVTile(15, i, val) * qk_4_value[3];
++        var sum = o_value_t(fetchVTile(0, i, val)) * qk_1[0];
++        sum += o_value_t(fetchVTile(1, i, val)) * qk_1[1];
++        sum += o_value_t(fetchVTile(2, i, val)) * qk_1[2];
++        sum += o_value_t(fetchVTile(3, i, val)) * qk_1[3];
++        sum += o_value_t(fetchVTile(4, i, val)) * qk_2[0];
++        sum += o_value_t(fetchVTile(5, i, val)) * qk_2[1];
++        sum += o_value_t(fetchVTile(6, i, val)) * qk_2[2];
++        sum += o_value_t(fetchVTile(7, i, val)) * qk_2[3];
++        sum += o_value_t(fetchVTile(8, i, val)) * qk_3[0];
++        sum += o_value_t(fetchVTile(9, i, val)) * qk_3[1];
++        sum += o_value_t(fetchVTile(10, i, val)) * qk_3[2];
++        sum += o_value_t(fetchVTile(11, i, val)) * qk_3[3];
++        sum += o_value_t(fetchVTile(12, i, val)) * qk_4[0];
++        sum += o_value_t(fetchVTile(13, i, val)) * qk_4[1];
++        sum += o_value_t(fetchVTile(14, i, val)) * qk_4[2];
++        sum += o_value_t(fetchVTile(15, i, val)) * qk_4[3];
+         o_tile[i] = o_tile[i] * o_ratio + sum;
+       }
+     } else {
+@@ -678,14 +690,14 @@ $MAIN {
+   #else
+         var val = q_value_t(0);
+   #endif
+-        var sum = fetchVTile(0, i, val) * qk_1_value[0];
+-        sum += fetchVTile(1, i, val) * qk_1_value[1];
+-        sum += fetchVTile(2, i, val) * qk_1_value[2];
+-        sum += fetchVTile(3, i, val) * qk_1_value[3];
+-        sum += fetchVTile(4, i, val) * qk_2_value[0];
+-        sum += fetchVTile(5, i, val) * qk_2_value[1];
+-        sum += fetchVTile(6, i, val) * qk_2_value[2];
+-        sum += fetchVTile(7, i, val) * qk_2_value[3];
++        var sum = o_value_t(fetchVTile(0, i, val)) * qk_1[0];
++        sum += o_value_t(fetchVTile(1, i, val)) * qk_1[1];
++        sum += o_value_t(fetchVTile(2, i, val)) * qk_1[2];
++        sum += o_value_t(fetchVTile(3, i, val)) * qk_1[3];
++        sum += o_value_t(fetchVTile(4, i, val)) * qk_2[0];
++        sum += o_value_t(fetchVTile(5, i, val)) * qk_2[1];
++        sum += o_value_t(fetchVTile(6, i, val)) * qk_2[2];
++        sum += o_value_t(fetchVTile(7, i, val)) * qk_2[3];
+         o_tile[i] = o_tile[i] * o_ratio + sum;
+       }
+     }
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/flash_attention_decode_gqa.wgsl.template
 new file mode 100644
 index 0000000..010733f
@@ -1978,6 +2124,43 @@ index d1d9c58..8c9b957 100644
      BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, BiasGelu)>,
      BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, BiasSplitGelu)>,
      BuildKernelCreateInfo<class ONNX_OPERATOR_KERNEL_CLASS_NAME(kWebGpuExecutionProvider, kMSDomain, 1, FastGelu)>,
+diff --git a/onnxruntime/core/framework/external_data_loader.cc b/onnxruntime/core/framework/external_data_loader.cc
+index 7b4dda4..6eea760 100644
+--- a/onnxruntime/core/framework/external_data_loader.cc
++++ b/onnxruntime/core/framework/external_data_loader.cc
+@@ -70,6 +70,22 @@ EM_ASYNC_JS(int, OrtLoadWebAssemblyExternalDataAsync,
+       }
+       if (length === 0) {
+         data = new Uint8Array(0);
++      } else if (load_type === 1 && Module.webgpuUploadExternalBuffer && length > 16777216) {
++        // BlinkFix fork (PM): a large GPU initializer goes up in 16 MB pieces,
++        // each read from the Blob and uploaded at its offset. No JavaScript
++        // buffer the size of the whole initializer (the scratch below grew to
++        // the largest one, 1 GB for Gemma 4 12B's output layer, and stayed),
++        // and the upload's staging memory stays bounded (post-webgpu.js).
++        const piece = 16777216;
++        for (let done = 0; done < length; done += piece) {
++          const n = Math.min(piece, length - done);
++          const part = new Uint8Array(await fileData.slice(offset + done, offset + done + n).arrayBuffer());
++          if (part.byteLength !== n) {
++            return 5;  // Reading from the Blob returned an unexpected number of bytes.
++          }
++          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, part, done);
++        }
++        return 0;
+       } else {
+         // Stream into a reused scratch buffer rather than slice().arrayBuffer(), which
+         // creates a large short-lived buffer per initializer and inflates peak memory.
+@@ -148,7 +164,8 @@ EM_ASYNC_JS(int, OrtLoadWebAssemblyExternalDataAsync,
+         // Load external data to GPU.
+         // TODO: use a unified interface for upload external buffer.
+         if (Module.webgpuUploadExternalBuffer) {
+-          Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
++          // BlinkFix fork (PM): wait when the upload asks for it (post-webgpu.js).
++          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
+         } else {
+           Module.jsepUploadExternalBuffer(dataIdOrBuffer, data);
+         }
 diff --git a/onnxruntime/core/graph/contrib_ops/bert_defs.cc b/onnxruntime/core/graph/contrib_ops/bert_defs.cc
 index faa9aca..1abed57 100644
 --- a/onnxruntime/core/graph/contrib_ops/bert_defs.cc
@@ -2034,136 +2217,204 @@ index 50e421b..00bbf48 100644
      fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, VarlenCausalConvWithState)>());
      fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, MurmurHash3)>());
      fn(GetOpSchema<ONNX_OPERATOR_SET_SCHEMA_CLASS_NAME(Microsoft, 1, NGramRepeatBlock)>());
-diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
-index b303182..85903e3 100644
---- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
-+++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
-@@ -208,7 +208,12 @@ Status RunLayerNormProgram(ComputeContext& context,
-   const uint32_t norm_size_vectorized = onnxruntime::narrow<uint32_t>((norm_size + components - 1) / components);
+diff --git a/onnxruntime/core/providers/webgpu/math/gemm_utils.cc b/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
+index b762c38..19b29d1 100644
+--- a/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
++++ b/onnxruntime/core/providers/webgpu/math/gemm_utils.cc
+@@ -217,6 +217,14 @@ void MatMulWriteFnSourceWithSplitK(ShaderHelper& shader,
+   EmitMatMulWriteFnFooter(shader);
+ }
  
-   // Check if we should use split norm dimension optimization
--  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
-+  // Batched-int4 fork: never. The split path runs only for one row and sums in
-+  // another order than the one-workgroup-per-row path, so a one-token decode
-+  // step and a k-token verify pass would normalize the same row to different
-+  // bits. On GPUs where MatMulNBits quantizes activations to int8 (DP4A) such
-+  // differences grow into different tokens.
-+  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
++// E4B fork (fp32 accumulation): both packed MatMul programs below keep their
++// shared-memory tiles in the input type (f16 stays f16, same memory), but cast
++// each tile value to f32 when it is read, and sum in f32 accumulators. The
++// result is cast back to the output type in mm_write. A product of two f16
++// values is exact in f32, so fused and unfused multiply-adds give the same
++// bits, and the vec4 and scalar programs sum each output in the same order.
++// Stock ORT summed an f16 MatMul in f16 (K = 768 already lost 1.7% relL2).
++// MatMul, Gemm and Conv2dMM all use these programs.
+ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+                                   const InlinedVector<int64_t>& elements_per_thread,
+                                   uint32_t workgroup_size_x,
+@@ -281,7 +289,7 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+       << "  let globalCol = i32(logical_global_id.x);\n"
+       << "  let globalRowStart = i32(logical_workgroup_id.y) * " << tile_a_outer << ";\n"
+       << "  let globalColStart = i32(logical_workgroup_id.x) * " << tile_b_outer << ";\n"
+-      << "  var acc: array<vec4<" << data_type << ">, rowPerThread>;\n";
++      << "  var acc: array<vec4<f32>, rowPerThread>;\n";
  
-   LayerNormProgram program{bias != nullptr, simplified, mean != nullptr, inv_std_dev != nullptr, split_norm_dim};
- 
-diff --git a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
-index 250b115..871ecc4 100644
---- a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
-+++ b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
-@@ -68,7 +68,12 @@ Status RMSNorm::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) co
+   if (split_k) {
+     // With Split-K, the original "workgroup" (with dispatch_z == 1 in API side) is split into
+@@ -365,17 +373,17 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+     if (transpose_a && transpose_b) {
+       shader.MainFunctionBody()
+           << "    for (var k = 0; k < tileInner / innerElementSize; k = k + 1) {\n"
+-          << "      let BCached0 = mm_Bsub[tileCol * innerElementSize][k];\n"
+-          << "      let BCached1 =  mm_Bsub[tileCol * innerElementSize + 1][k];\n"
+-          << "      let BCached2 =  mm_Bsub[tileCol * innerElementSize + 2][k];\n";
++          << "      let BCached0 = vec4<f32>(mm_Bsub[tileCol * innerElementSize][k]);\n"
++          << "      let BCached1 =  vec4<f32>(mm_Bsub[tileCol * innerElementSize + 1][k]);\n"
++          << "      let BCached2 =  vec4<f32>(mm_Bsub[tileCol * innerElementSize + 2][k]);\n";
+       if (inner_elements_size != 3) {
+-        shader.MainFunctionBody() << "      let BCached3 = mm_Bsub[tileCol * innerElementSize + 3][k];\n";
++        shader.MainFunctionBody() << "      let BCached3 = vec4<f32>(mm_Bsub[tileCol * innerElementSize + 3][k]);\n";
+       }
+       shader.MainFunctionBody()
+-          << "      let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
+-          << "      let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
+-          << "      let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n"
+-          << (inner_elements_size == 3 ? "" : "      let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n")
++          << "      let ACached0 = vec4<f32>(mm_Asub[k * innerElementSize][localRow]);\n"
++          << "      let ACached1 = vec4<f32>(mm_Asub[k * innerElementSize + 1][localRow]);\n"
++          << "      let ACached2 = vec4<f32>(mm_Asub[k * innerElementSize + 2][localRow]);\n"
++          << (inner_elements_size == 3 ? "" : "      let ACached3 = vec4<f32>(mm_Asub[k * innerElementSize + 3][localRow]);\n")
+           << "      for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+           << "             acc[i].x += ACached0[i] * BCached0.x + ACached1[i] * BCached0.y + ACached2[i] * BCached0.z + ACached3[i] * BCached0.w;\n"
+           << "             acc[i].y += ACached0[i] * BCached1.x + ACached1[i] * BCached1.y + ACached2[i] * BCached1.z + ACached3[i] * BCached1.w;\n"
+@@ -385,17 +393,17 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+     } else if (transpose_a && !transpose_b) {
+       shader.MainFunctionBody()
+           << "    for (var k = 0; k < tileInner / innerElementSize; k = k + 1) {\n"
+-          << "      let BCached0 = mm_Bsub[k * innerElementSize][tileCol];\n"
+-          << "      let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n"
+-          << "      let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];\n";
++          << "      let BCached0 = vec4<f32>(mm_Bsub[k * innerElementSize][tileCol]);\n"
++          << "      let BCached1 = vec4<f32>(mm_Bsub[k * innerElementSize + 1][tileCol]);\n"
++          << "      let BCached2 = vec4<f32>(mm_Bsub[k * innerElementSize + 2][tileCol]);\n";
+       if (inner_elements_size != 3) {
+-        shader.MainFunctionBody() << "      let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
++        shader.MainFunctionBody() << "      let BCached3 = vec4<f32>(mm_Bsub[k * innerElementSize + 3][tileCol]);\n";
+       }
+       shader.MainFunctionBody()
+-          << "      let ACached0 = mm_Asub[k * innerElementSize][localRow];\n"
+-          << "      let ACached1 = mm_Asub[k * innerElementSize + 1][localRow];\n"
+-          << "      let ACached2 = mm_Asub[k * innerElementSize + 2][localRow];\n"
+-          << (inner_elements_size == 3 ? "" : "      let ACached3 = mm_Asub[k * innerElementSize + 3][localRow];\n")
++          << "      let ACached0 = vec4<f32>(mm_Asub[k * innerElementSize][localRow]);\n"
++          << "      let ACached1 = vec4<f32>(mm_Asub[k * innerElementSize + 1][localRow]);\n"
++          << "      let ACached2 = vec4<f32>(mm_Asub[k * innerElementSize + 2][localRow]);\n"
++          << (inner_elements_size == 3 ? "" : "      let ACached3 = vec4<f32>(mm_Asub[k * innerElementSize + 3][localRow]);\n")
+           << "      for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+           << "        let ACached = mm_Asub[tileCol][i];\n"
+           << "        acc[i] = BCached0 * ACached0[i] + acc[i];\n"
+@@ -406,15 +414,15 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+     } else if (!transpose_a && transpose_b) {
+       shader.MainFunctionBody()
+           << "    for (var k = 0; k < tileInner / innerElementSize; k = k + 1) {\n"
+-          << "      let BCached0 = mm_Bsub[tileCol * innerElementSize][k];\n"
+-          << "      let BCached1 =  mm_Bsub[tileCol * innerElementSize + 1][k];\n"
+-          << "      let BCached2 =  mm_Bsub[tileCol * innerElementSize + 2][k];\n";
++          << "      let BCached0 = vec4<f32>(mm_Bsub[tileCol * innerElementSize][k]);\n"
++          << "      let BCached1 =  vec4<f32>(mm_Bsub[tileCol * innerElementSize + 1][k]);\n"
++          << "      let BCached2 =  vec4<f32>(mm_Bsub[tileCol * innerElementSize + 2][k]);\n";
+       if (inner_elements_size != 3) {
+-        shader.MainFunctionBody() << "      let BCached3 = mm_Bsub[tileCol * innerElementSize + 3][k];\n";
++        shader.MainFunctionBody() << "      let BCached3 = vec4<f32>(mm_Bsub[tileCol * innerElementSize + 3][k]);\n";
+       }
+       shader.MainFunctionBody()
+           << "      for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+-          << "        let ACached = mm_Asub[tileRow + i][k];\n"
++          << "        let ACached = vec" << inner_elements_size << "<f32>(mm_Asub[tileRow + i][k]);\n"
+           << "        acc[i].x += dot(ACached, BCached0);\n"
+           << "        acc[i].y += dot(ACached, BCached1);\n"
+           << "        acc[i].z += dot(ACached, BCached2);\n"
+@@ -423,15 +431,15 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+     } else {
+       shader.MainFunctionBody()
+           << "    for (var k = 0; k < tileInner / innerElementSize; k = k + 1) {\n"
+-          << "      let BCached0 = mm_Bsub[k * innerElementSize][tileCol];\n"
+-          << "      let BCached1 = mm_Bsub[k * innerElementSize + 1][tileCol];\n"
+-          << "      let BCached2 = mm_Bsub[k * innerElementSize + 2][tileCol];\n";
++          << "      let BCached0 = vec4<f32>(mm_Bsub[k * innerElementSize][tileCol]);\n"
++          << "      let BCached1 = vec4<f32>(mm_Bsub[k * innerElementSize + 1][tileCol]);\n"
++          << "      let BCached2 = vec4<f32>(mm_Bsub[k * innerElementSize + 2][tileCol]);\n";
+       if (inner_elements_size != 3) {
+-        shader.MainFunctionBody() << "      let BCached3 = mm_Bsub[k * innerElementSize + 3][tileCol];\n";
++        shader.MainFunctionBody() << "      let BCached3 = vec4<f32>(mm_Bsub[k * innerElementSize + 3][tileCol]);\n";
+       }
+       shader.MainFunctionBody()
+           << "      for (var i = 0; i < rowPerThread; i = i + 1) {\n"
+-          << "        let ACached = mm_Asub[tileRow + i][k];\n"
++          << "        let ACached = vec" << inner_elements_size << "<f32>(mm_Asub[tileRow + i][k]);\n"
+           << "        acc[i] = BCached0 * ACached.x + acc[i];\n"
+           << "        acc[i] = BCached1 * ACached.y + acc[i];\n"
+           << "        acc[i] = BCached2 * ACached.z + acc[i];\n"
+@@ -446,7 +454,7 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+     // Calculate alpha * acc
+     if (alpha != 1.0f) {
+       shader.MainFunctionBody() << "  for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n"
+-                                << "    acc[innerRow] = output_element_t(uniforms.alpha) * acc[innerRow];\n"
++                                << "    acc[innerRow] = f32(uniforms.alpha) * acc[innerRow];\n"
+                                 << "  }\n";
+     }
+   }
+@@ -455,10 +463,10 @@ Status MakeMatMulPackedVec4Source(ShaderHelper& shader,
+   shader.MainFunctionBody() << "  for (var innerRow = 0; innerRow < rowPerThread; innerRow = innerRow + 1) {\n";
+   if (output_components == 1) {
+     shader.MainFunctionBody() << " for (var i = 0; i < innerElementSize; i = i + 1) {\n"
+-                              << "    mm_write(batch, globalRow + innerRow, globalCol * innerElementSize + i, acc[innerRow][i]);\n"
++                              << "    mm_write(batch, globalRow + innerRow, globalCol * innerElementSize + i, " << data_type << "(acc[innerRow][i]));\n"
+                               << "  }\n";
+   } else {
+-    shader.MainFunctionBody() << "    mm_write(batch, globalRow + innerRow, globalCol, acc[innerRow]);\n";
++    shader.MainFunctionBody() << "    mm_write(batch, globalRow + innerRow, globalCol, vec4<" << data_type << ">(acc[innerRow]));\n";
    }
  
-   // Check if we should use split norm dimension optimization
--  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
-+  // Batched-int4 fork: never (same rule as LayerNorm in layer_norm.cc). The
-+  // split path runs only for one row (for example a global layer's k_norm, one
-+  // row of 512 at S = 1) and sums in another order than the
-+  // one-workgroup-per-row path, so a one-token decode step and a k-token
-+  // verify pass would normalize the same row to different bits.
-+  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+   shader.MainFunctionBody() << "  }\n";
+@@ -517,7 +525,7 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
+                             << (nullptr != batch_dims ? "  let batchIndices = " + batch_dims->OffsetToIndices("u32(batch)") + ";\n" : "")
+                             << " let num_tiles = (uniforms.dim_inner - 1) / tileInner + 1;\n"
+                             << " var kStart = 0;\n"
+-                            << " var acc: array<array<" << data_type << ", colPerThread>, rowPerThread>;\n";
++                            << " var acc: array<array<f32, colPerThread>, rowPerThread>;\n";
  
-   // Reuse LayerNormProgram with simplified=true, has_bias=false, no mean output
-   LayerNormProgram program{/*has_bias=*/false, /*simplified=*/true, /*has_mean_output=*/false,
-diff --git a/onnxruntime/core/framework/external_data_loader.cc b/onnxruntime/core/framework/external_data_loader.cc
---- a/onnxruntime/core/framework/external_data_loader.cc
-+++ b/onnxruntime/core/framework/external_data_loader.cc
-@@ -70,6 +70,22 @@
-       }
-       if (length === 0) {
-         data = new Uint8Array(0);
-+      } else if (load_type === 1 && Module.webgpuUploadExternalBuffer && length > 16777216) {
-+        // BlinkFix fork (PM): a large GPU initializer goes up in 16 MB pieces,
-+        // each read from the Blob and uploaded at its offset. No JavaScript
-+        // buffer the size of the whole initializer (the scratch below grew to
-+        // the largest one, 1 GB for Gemma 4 12B's output layer, and stayed),
-+        // and the upload's staging memory stays bounded (post-webgpu.js).
-+        const piece = 16777216;
-+        for (let done = 0; done < length; done += piece) {
-+          const n = Math.min(piece, length - done);
-+          const part = new Uint8Array(await fileData.slice(offset + done, offset + done + n).arrayBuffer());
-+          if (part.byteLength !== n) {
-+            return 5;  // Reading from the Blob returned an unexpected number of bytes.
-+          }
-+          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, part, done);
-+        }
-+        return 0;
-       } else {
-         // Stream into a reused scratch buffer rather than slice().arrayBuffer(), which
-         // creates a large short-lived buffer per initializer and inflates peak memory.
-@@ -148,7 +164,8 @@
-         // Load external data to GPU.
-         // TODO: use a unified interface for upload external buffer.
-         if (Module.webgpuUploadExternalBuffer) {
--          Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
-+          // BlinkFix fork (PM): wait when the upload asks for it (post-webgpu.js).
-+          await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, data);
-         } else {
-           Module.jsepUploadExternalBuffer(dataIdOrBuffer, data);
-         }
-diff --git a/onnxruntime/wasm/post-webgpu.js b/onnxruntime/wasm/post-webgpu.js
---- a/onnxruntime/wasm/post-webgpu.js
-+++ b/onnxruntime/wasm/post-webgpu.js
-@@ -209,7 +209,17 @@
-   };
+   shader.MainFunctionBody()
+       << "let tileRow = i32(local_id.y) * rowPerThread;\n"
+@@ -559,21 +567,21 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
  
-   // Setup a callback function for loading external buffers (model weights).
--  Module.webgpuUploadExternalBuffer = (bufferHandle, data) => {
-+  //
-+  // BlinkFix fork (PM): `data` goes `dstOffset` bytes into the buffer (the
-+  // JSPI loader uploads a large initializer in 16 MB pieces), and after every
-+  // 64 MB handed to the GPU the function returns a Promise that resolves once
-+  // the queue has done that work; the JSPI loader awaits it. Chrome keeps the
-+  // shared memory of each staging buffer in a pool that never shrinks, so
-+  // without the wait the pool grows to the bytes in flight: about 1 GB left in
-+  // the GPU process after loading Gemma 4 12B. With it the pool stays small.
-+  // Callers that do not await (the asyncify loader) are unaffected.
-+  let webgpuUploadPendingBytes = 0;
-+  Module.webgpuUploadExternalBuffer = (bufferHandle, data, dstOffset = 0) => {
-     const srcArrayBuffer = data.buffer;
-     const srcOffset = data.byteOffset;
-     const srcLength = data.byteLength;
-@@ -252,10 +262,16 @@
-       gpuBufferForUploading,
-       0,
-       gpuBuffer,
--      0,
-+      dstOffset,
-       size
-     );
-     webgpuCurrentDevice.queue.submit([commandEncoder.finish()]);
-     gpuBufferForUploading.destroy();
-+    webgpuUploadPendingBytes += size;
-+    if (webgpuUploadPendingBytes >= 64 * 1024 * 1024) {
-+      webgpuUploadPendingBytes = 0;
-+      return webgpuCurrentDevice["queue"]["onSubmittedWorkDone"]();
-+    }
-+    return undefined;
-   };
- };
-diff --git a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
-index 5658cca..4d8cf38 100644
---- a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
-+++ b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
-@@ -473,7 +473,12 @@ Status ReduceKernel<allow_multi_axes>::ComputeInternal(ComputeContext& context)
-       ORT_RETURN_IF_ERROR(context.RunProgram(transpose_program));
-       input_tensor = &input_transpose;
+     // Compute acc values for a single thread.
+     shader.MainFunctionBody()
+-        << "var BCached: array<" << data_type << ", colPerThread>;\n"
++        << "var BCached: array<f32, colPerThread>;\n"
+         << "  for (var k = 0; k < tileInner; k = k + 1) {\n"
+         << "    for (var inner = 0; inner < i32(colPerThread); inner = inner + 1) {\n";
+     if (transpose_b) {
+-      shader.MainFunctionBody() << "      BCached[inner] = mm_Bsub[tileCol + inner][k];\n";
++      shader.MainFunctionBody() << "      BCached[inner] = f32(mm_Bsub[tileCol + inner][k]);\n";
+     } else {
+       shader.MainFunctionBody()
+-          << "      BCached[inner] = mm_Bsub[k][tileCol + inner];\n";
++          << "      BCached[inner] = f32(mm_Bsub[k][tileCol + inner]);\n";
      }
--    auto workgroup_size = output_size == 1 ? static_cast<uint32_t>(256) : static_cast<uint32_t>(WORKGROUP_SIZE);
-+    // Batched-int4 fork: one workgroup size for every output size (stock uses
-+    // 256 threads for a single output). A global layer's value norm reduces one
-+    // row of 512 per token, so a one-token step (one output) and a k-token verify
-+    // pass (k outputs) summed the same row in different orders (lowmem C1,
-+    // scripts/lowmem-batchinv.html).
-+    auto workgroup_size = static_cast<uint32_t>(WORKGROUP_SIZE);
-     ReduceSharedProgram program(name_, reduce_op_type, workgroup_size);
-     program.CacheHint(keepdims_,
-                       noop_with_empty_axes_,
+     shader.MainFunctionBody() << "    }\n"
+                               << "    for (var innerRow = 0; innerRow < i32(rowPerThread); innerRow = innerRow + 1) {\n";
+     if (transpose_a) {
+-      shader.MainFunctionBody() << "      let ACached = mm_Asub[k][tileRow + innerRow];\n";
++      shader.MainFunctionBody() << "      let ACached = f32(mm_Asub[k][tileRow + innerRow]);\n";
+     } else {
+-      shader.MainFunctionBody() << "      let ACached = mm_Asub[tileRow + innerRow][k];\n";
++      shader.MainFunctionBody() << "      let ACached = f32(mm_Asub[tileRow + innerRow][k]);\n";
+     }
+     shader.MainFunctionBody() << "      for (var innerCol = 0; innerCol < i32(colPerThread); innerCol = innerCol + 1) {\n"
+                               << "        acc[innerRow][innerCol] = acc[innerRow][innerCol] + ACached * BCached[innerCol];\n"
+@@ -587,7 +595,7 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
+     if (alpha != 1.0f) {
+       shader.MainFunctionBody() << "for (var innerRow = 0; innerRow < i32(rowPerThread); innerRow = innerRow + 1) {\n"
+                                 << "  for (var innerCol = 0; innerCol < i32(colPerThread); innerCol = innerCol + 1) {\n"
+-                                << "    acc[innerRow][innerCol] = output_element_t(uniforms.alpha) * acc[innerRow][innerCol];\n"
++                                << "    acc[innerRow][innerCol] = f32(uniforms.alpha) * acc[innerRow][innerCol];\n"
+                                 << "  }\n"
+                                 << "}\n";
+     }
+@@ -596,7 +604,7 @@ Status MakeMatMulPackedSource(ShaderHelper& shader,
+   shader.MainFunctionBody()
+       << "for (var innerRow = 0; innerRow < i32(rowPerThread); innerRow = innerRow + 1) {\n"
+       << "  for (var innerCol = 0; innerCol < i32(colPerThread); innerCol = innerCol + 1) {\n"
+-      << "    mm_write(batch, globalRow + innerRow, globalCol + innerCol, acc[innerRow][innerCol]);\n"
++      << "    mm_write(batch, globalRow + innerRow, globalCol + innerCol, " << data_type << "(acc[innerRow][innerCol]));\n"
+       << "  }\n"
+       << "}\n";
+   return Status::OK();
 diff --git a/onnxruntime/core/providers/webgpu/math/matmul.cc b/onnxruntime/core/providers/webgpu/math/matmul.cc
 index 6515757..7ade01d 100644
 --- a/onnxruntime/core/providers/webgpu/math/matmul.cc
@@ -2223,3 +2474,218 @@ index 6515757..7ade01d 100644
      const SplitKConfig& split_k_config = context->GetSplitKConfig();
      const bool need_split_k = split_k_config.UseSplitK(
          is_vec4, activation.activation_kind_, batch_size, dim_a_outer, dim_b_outer,
+diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+index b303182..85903e3 100644
+--- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
+@@ -208,7 +208,12 @@ Status RunLayerNormProgram(ComputeContext& context,
+   const uint32_t norm_size_vectorized = onnxruntime::narrow<uint32_t>((norm_size + components - 1) / components);
+ 
+   // Check if we should use split norm dimension optimization
+-  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never. The split path runs only for one row and sums in
++  // another order than the one-workgroup-per-row path, so a one-token decode
++  // step and a k-token verify pass would normalize the same row to different
++  // bits. On GPUs where MatMulNBits quantizes activations to int8 (DP4A) such
++  // differences grow into different tokens.
++  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+ 
+   LayerNormProgram program{bias != nullptr, simplified, mean != nullptr, inv_std_dev != nullptr, split_norm_dim};
+ 
+diff --git a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
+index 250b115..871ecc4 100644
+--- a/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
++++ b/onnxruntime/core/providers/webgpu/nn/rms_norm.cc
+@@ -68,7 +68,12 @@ Status RMSNorm::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) co
+   }
+ 
+   // Check if we should use split norm dimension optimization
+-  const bool split_norm_dim = norm_size % 512 == 0 && norm_count == 1;
++  // Batched-int4 fork: never (same rule as LayerNorm in layer_norm.cc). The
++  // split path runs only for one row (for example a global layer's k_norm, one
++  // row of 512 at S = 1) and sums in another order than the
++  // one-workgroup-per-row path, so a one-token decode step and a k-token
++  // verify pass would normalize the same row to different bits.
++  const bool split_norm_dim = false && norm_size % 512 == 0 && norm_count == 1;
+ 
+   // Reuse LayerNormProgram with simplified=true, has_bias=false, no mean output
+   LayerNormProgram program{/*has_bias=*/false, /*simplified=*/true, /*has_mean_output=*/false,
+diff --git a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
+index 5658cca..4d8cf38 100644
+--- a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
++++ b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
+@@ -473,7 +473,12 @@ Status ReduceKernel<allow_multi_axes>::ComputeInternal(ComputeContext& context)
+       ORT_RETURN_IF_ERROR(context.RunProgram(transpose_program));
+       input_tensor = &input_transpose;
+     }
+-    auto workgroup_size = output_size == 1 ? static_cast<uint32_t>(256) : static_cast<uint32_t>(WORKGROUP_SIZE);
++    // Batched-int4 fork: one workgroup size for every output size (stock uses
++    // 256 threads for a single output). A global layer's value norm reduces one
++    // row of 512 per token, so a one-token step (one output) and a k-token verify
++    // pass (k outputs) summed the same row in different orders (lowmem C1,
++    // scripts/lowmem-batchinv.html).
++    auto workgroup_size = static_cast<uint32_t>(WORKGROUP_SIZE);
+     ReduceSharedProgram program(name_, reduce_op_type, workgroup_size);
+     program.CacheHint(keepdims_,
+                       noop_with_empty_axes_,
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.cc b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+index ff85ff9..3e5e454 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.cc
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.cc
+@@ -222,12 +222,22 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
+       device_limits_.maxStorageBufferBindingSize -=
+           (device_limits_.maxStorageBufferBindingSize % device_limits_.minStorageBufferOffsetAlignment);
+     }
++    // gpu-neutral: kernels choose programs from these limits, so they are the
++    // WebGPU defaults on every GPU (a device given from outside may have more).
++    GpuNeutralLimits(device_limits_);
+     // cache device features
+     wgpu::SupportedFeatures supported_features;
+     Device().GetFeatures(&supported_features);
+     for (size_t i = 0; i < supported_features.featureCount; i++) {
+       device_features_.insert(supported_features.features[i]);
+     }
++    // gpu-neutral: no subgroup operations. Subgroup width is 4 to 128 lanes
++    // depending on the GPU, and drivers differ in how subgroup operations
++    // behave, so a kernel that uses them is not the same program everywhere.
++    // A device given from outside may have these features; kernels never see them.
++    device_features_.erase(wgpu::FeatureName::Subgroups);
++    device_features_.erase(wgpu::FeatureName::SubgroupSizeControl);
++    device_features_.erase(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);
+     // cache adapter info
+     if (DeviceHasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix)) {
+       adapter_info_.nextInChain = &subgroup_matrix_configs_;
+@@ -252,7 +262,7 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
+     program_mgr_ = std::make_unique<ProgramManager>(*this);
+ 
+     // create split-k config
+-    split_k_config_ = std::make_unique<SplitKConfig>(adapter_info_);
++    split_k_config_ = std::make_unique<SplitKConfig>(kernel_adapter_info_);
+ 
+     // set query type
+ #if !defined(__wasm__)
+@@ -794,11 +804,10 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
+ #if !defined(__wasm__)
+       wgpu::FeatureName::ChromiumExperimentalTimestampQueryInsidePasses,
+ #endif
+-      wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix,
++      // gpu-neutral: no ChromiumExperimentalSubgroupMatrix, Subgroups or
++      // SubgroupSizeControl (see the device feature cache above).
+       wgpu::FeatureName::TimestampQuery,
+       wgpu::FeatureName::ShaderF16,
+-      wgpu::FeatureName::Subgroups,
+-      wgpu::FeatureName::SubgroupSizeControl,
+ #if !defined(__wasm__)
+       wgpu::FeatureName::BufferMapExtendedUsages,
+ #endif
+@@ -811,15 +820,31 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
+   return required_features;
+ }
+ 
++void WebGpuContext::GpuNeutralLimits(wgpu::Limits& limits) {
++  // The WebGPU specification's default limits, which every WebGPU device has.
++  // Kernels read these to pick tile sizes, fused programs and shared-memory
++  // paths; with the same values everywhere every GPU runs the same programs.
++  limits.maxBindGroups = std::min(limits.maxBindGroups, 4u);
++  limits.maxBindingsPerBindGroup = std::min(limits.maxBindingsPerBindGroup, 1000u);
++  limits.maxStorageBuffersPerShaderStage = std::min(limits.maxStorageBuffersPerShaderStage, 8u);
++  limits.maxUniformBuffersPerShaderStage = std::min(limits.maxUniformBuffersPerShaderStage, 12u);
++  limits.maxComputeWorkgroupStorageSize = std::min(limits.maxComputeWorkgroupStorageSize, 16384u);
++  limits.maxComputeInvocationsPerWorkgroup = std::min(limits.maxComputeInvocationsPerWorkgroup, 256u);
++  limits.maxComputeWorkgroupSizeX = std::min(limits.maxComputeWorkgroupSizeX, 256u);
++  limits.maxComputeWorkgroupSizeY = std::min(limits.maxComputeWorkgroupSizeY, 256u);
++  limits.maxComputeWorkgroupSizeZ = std::min(limits.maxComputeWorkgroupSizeZ, 64u);
++  limits.maxComputeWorkgroupsPerDimension = std::min(limits.maxComputeWorkgroupsPerDimension, 65535u);
++}
++
+ wgpu::Limits WebGpuContext::GetRequiredLimits(const wgpu::Adapter& adapter) const {
+   wgpu::Limits required_limits{};
+   wgpu::Limits adapter_limits;
+   ORT_ENFORCE(adapter.GetLimits(&adapter_limits) == wgpu::Status::Success);
+ 
+-  required_limits.maxBindGroups = adapter_limits.maxBindGroups;
+-  required_limits.maxComputeWorkgroupStorageSize = adapter_limits.maxComputeWorkgroupStorageSize;
+-  required_limits.maxComputeWorkgroupsPerDimension = adapter_limits.maxComputeWorkgroupsPerDimension;
+-  required_limits.maxStorageBuffersPerShaderStage = adapter_limits.maxStorageBuffersPerShaderStage;
++  // gpu-neutral: the limits that kernels choose programs from stay at the
++  // WebGPU defaults (GpuNeutralLimits), so they are not requested here. Only
++  // the buffer sizes, which decide what fits and not which program runs, come
++  // from the adapter.
+ 
+   if (max_storage_buffer_binding_size_ == 0) {
+     // If not set by the user, use the adapter limit.
+diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.h b/onnxruntime/core/providers/webgpu/webgpu_context.h
+index 1790c85..80a11b2 100644
+--- a/onnxruntime/core/providers/webgpu/webgpu_context.h
++++ b/onnxruntime/core/providers/webgpu/webgpu_context.h
+@@ -221,7 +221,12 @@ class WebGpuContext final {
+   const wgpu::Instance& Instance() const { return instance_; }
+   const wgpu::Device& Device() const { return device_; }
+ 
+-  const wgpu::AdapterInfo& AdapterInfo() const { return adapter_info_; }
++  // batched-int4 fork (gpu-neutral): kernels read this, never the real adapter
++  // info. Every field is empty or zero, so no kernel picks a program, a tile
++  // size or a shader branch by GPU brand, architecture or subgroup width: every
++  // GPU runs the same programs. See GpuNeutralLimits() and
++  // GetAvailableRequiredFeatures() for the limits and features.
++  const wgpu::AdapterInfo& AdapterInfo() const { return kernel_adapter_info_; }
+   const wgpu::Limits& DeviceLimits() const { return device_limits_; }
+   bool DeviceHasFeature(wgpu::FeatureName feature) const { return device_features_.contains(feature); }
+   const wgpu::AdapterPropertiesSubgroupMatrixConfigs& SubgroupMatrixConfigs() const { return subgroup_matrix_configs_; }
+@@ -367,6 +372,7 @@ class WebGpuContext final {
+   std::vector<const char*> GetDisabledDeviceToggles() const;
+   std::vector<wgpu::FeatureName> GetAvailableRequiredFeatures(const wgpu::Adapter& adapter) const;
+   wgpu::Limits GetRequiredLimits(const wgpu::Adapter& adapter) const;
++  static void GpuNeutralLimits(wgpu::Limits& limits);
+   void WriteTimestamp(uint32_t query_index);
+ 
+   struct PendingQueryInfo {
+@@ -400,6 +406,7 @@ class WebGpuContext final {
+ 
+   wgpu::Queue device_queue_;
+   wgpu::AdapterInfo adapter_info_;
++  wgpu::AdapterInfo kernel_adapter_info_;  // stays default: see AdapterInfo()
+   wgpu::Limits device_limits_;
+   std::unordered_set<wgpu::FeatureName> device_features_;
+   wgpu::AdapterPropertiesSubgroupMatrixConfigs subgroup_matrix_configs_;
+diff --git a/onnxruntime/wasm/post-webgpu.js b/onnxruntime/wasm/post-webgpu.js
+index 09e7ee7..85ee63b 100644
+--- a/onnxruntime/wasm/post-webgpu.js
++++ b/onnxruntime/wasm/post-webgpu.js
+@@ -209,7 +209,17 @@ Module["webgpuInit"] = (setDefaultDevice) => {
+   };
+ 
+   // Setup a callback function for loading external buffers (model weights).
+-  Module.webgpuUploadExternalBuffer = (bufferHandle, data) => {
++  //
++  // BlinkFix fork (PM): `data` goes `dstOffset` bytes into the buffer (the
++  // JSPI loader uploads a large initializer in 16 MB pieces), and after every
++  // 64 MB handed to the GPU the function returns a Promise that resolves once
++  // the queue has done that work; the JSPI loader awaits it. Chrome keeps the
++  // shared memory of each staging buffer in a pool that never shrinks, so
++  // without the wait the pool grows to the bytes in flight: about 1 GB left in
++  // the GPU process after loading Gemma 4 12B. With it the pool stays small.
++  // Callers that do not await (the asyncify loader) are unaffected.
++  let webgpuUploadPendingBytes = 0;
++  Module.webgpuUploadExternalBuffer = (bufferHandle, data, dstOffset = 0) => {
+     const srcArrayBuffer = data.buffer;
+     const srcOffset = data.byteOffset;
+     const srcLength = data.byteLength;
+@@ -252,10 +262,16 @@ Module["webgpuInit"] = (setDefaultDevice) => {
+       gpuBufferForUploading,
+       0,
+       gpuBuffer,
+-      0,
++      dstOffset,
+       size
+     );
+     webgpuCurrentDevice.queue.submit([commandEncoder.finish()]);
+     gpuBufferForUploading.destroy();
++    webgpuUploadPendingBytes += size;
++    if (webgpuUploadPendingBytes >= 64 * 1024 * 1024) {
++      webgpuUploadPendingBytes = 0;
++      return webgpuCurrentDevice["queue"]["onSubmittedWorkDone"]();
++    }
++    return undefined;
+   };
+ };

@@ -176,6 +176,23 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
   grep -q 'webgpuUploadPendingBytes >= 64 \* 1024 \* 1024' onnxruntime/wasm/post-webgpu.js &&
     grep -q 'await Module.webgpuUploadExternalBuffer(dataIdOrBuffer, part, done);' onnxruntime/core/framework/external_data_loader.cc || {
       echo "reference patch lacks the PM chunked weight upload; refusing" >&2; exit 1; }
+  # GN (gpu-neutral): every GPU runs the same programs. Kernels read an empty
+  # adapter info (no brand, architecture or subgroup width), the device has no
+  # subgroup features, and the limits kernels choose from are the WebGPU
+  # defaults. Nothing else may read the real adapter.
+  ctx=onnxruntime/core/providers/webgpu/webgpu_context
+  grep -q 'const wgpu::AdapterInfo& AdapterInfo() const { return kernel_adapter_info_; }' $ctx.h &&
+    grep -q 'SplitKConfig>(kernel_adapter_info_)' $ctx.cc &&
+    grep -q '^    GpuNeutralLimits(device_limits_);$' $ctx.cc &&
+    grep -q 'device_features_.erase(wgpu::FeatureName::Subgroups);' $ctx.cc &&
+    grep -q 'device_features_.erase(wgpu::FeatureName::SubgroupSizeControl);' $ctx.cc &&
+    grep -q 'device_features_.erase(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix);' $ctx.cc &&
+    ! sed -n '/GetAvailableRequiredFeatures(const wgpu::Adapter/,/return required_features;/p' $ctx.cc |
+        grep -v '^ *//' | grep -q 'Subgroup' &&
+    [ "$(grep -cE '(^|[^a-z_])adapter_info_' $ctx.cc)" = 2 ] &&
+    ! grep -rn -E 'GetAdapterInfo|\.GetInfo\(|(^|[^a-z_])adapter_info_' onnxruntime/contrib_ops/webgpu onnxruntime/core/providers/webgpu |
+        grep -v "^$ctx\." | grep -q . || {
+      echo "reference patch is not GPU-neutral (GN): a kernel can see the GPU brand, subgroups or adapter limits; refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
