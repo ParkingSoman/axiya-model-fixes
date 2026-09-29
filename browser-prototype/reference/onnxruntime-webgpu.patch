@@ -215,10 +215,51 @@ index 1f95a2f..3deb391 100644
          let ip = vp - state_length;
          state_val = input[input_base + ip * input_pos_stride];
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
-index a800232..f743403 100644
+index a800232..c73d6b1 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
-@@ -919,6 +919,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
+@@ -16,6 +16,12 @@ using namespace ::onnxruntime::common;
+ using namespace ONNX_NAMESPACE;
+ using namespace onnxruntime::contrib::multihead_attention_helper;
+ 
++#include <algorithm>
++
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#endif
++
+ namespace onnxruntime {
+ namespace contrib {
+ namespace webgpu {
+@@ -309,6 +315,27 @@ Status PrepareIndirectDispatchProgram::GenerateShaderCode(ShaderHelper& shader)
+   return Status::OK();
+ }
+ 
++// gpu-slices: the most query x key x head-size products one flash-attention
++// prefill dispatch may do. 2^32 is at most about 400 ms on an Intel gen-9
++// laptop GPU (the slow reference; Small at imageBudget 1120: longest slice
++// 404 ms, 4.9x under the Windows 2 s GPU timeout) and about 15 ms on an Apple
++// M5. Fixed for every GPU. A page may override it for a measurement only
++// (globalThis.ortWebGpuFlashAttentionSliceWork, ?gpuSliceLog2), read once.
++constexpr uint64_t kFlashAttentionSliceWork = uint64_t{1} << 32;
++uint64_t FlashAttentionSliceWork() {
++  static const uint64_t work = [] {
++#if defined(__EMSCRIPTEN__)
++    const double v = EM_ASM_DOUBLE({
++      const v = globalThis['ortWebGpuFlashAttentionSliceWork'];  // quoted: the glue is minified
++      return typeof v === 'number' && v > 0 ? v : 0;
++    });
++    if (v > 0) return static_cast<uint64_t>(v);
++#endif
++    return kFlashAttentionSliceWork;
++  }();
++  return work;
++}
++
+ Status CopyKVCache(onnxruntime::webgpu::ComputeContext& context, const WebgpuAttentionParameters& parameters,
+                    const Tensor* K, const Tensor* past_key, Tensor* present_key,
+                    const Tensor* V, const Tensor* past_value, Tensor* present_value,
+@@ -919,6 +946,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
    return context.RunProgram(program);
  }
  
@@ -352,9 +393,178 @@ index a800232..f743403 100644
  Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
                             Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
                             const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context, const Tensor* seqlen_k,
-@@ -1366,6 +1493,11 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
- 
-       ORT_RETURN_IF_ERROR(context.RunProgram(program));
+@@ -1288,84 +1442,107 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+       bool is_fp16 = is_fp16_q;
+       bool q_BNSH = parameters.qkv_format_ == Q_K_V_BNSH;
+       bool has_head_sink = head_sink != nullptr;
+-      FlashAttentionProgram program{"FlashAttention",
+-                                    has_attention_bias,
+-                                    is_qualcomm,
+-                                    is_fp16,
+-                                    parameters.head_size_,
+-                                    parameters.num_heads_,
+-                                    parameters.is_unidirectional_,
+-                                    is_nvidia,
+-                                    is_apple,
+-                                    has_subgroups,
+-                                    q_BNSH,
+-                                    use_seqlen_k,
+-                                    has_head_sink,
+-                                    has_local_window,
+-                                    kv_cache_quantization_bits,
+-                                    compressed_head_size_u32,
+-                                    use_seqlens_q};
+-      // When TQ is active, KV cache is u32-packed — use u32 tensor views for present_key/present_value.
+-      const Tensor* fa_present_key =
+-          kv_cache_quantization_enabled ? quantized_present_key : present_key;
+-      const Tensor* fa_present_value =
+-          kv_cache_quantization_enabled ? quantized_present_value : present_value;
+-      program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
+-                         {fa_present_key, ProgramTensorMetadataDependency::TypeAndRank,
+-                          kv_cache_quantization_enabled ? 1 : 4},
+-                         {fa_present_value, ProgramTensorMetadataDependency::TypeAndRank,
+-                          kv_cache_quantization_enabled ? 1 : 4}});
+-      if (has_attention_bias) {
+-        program.AddInputs({{attention_bias, ProgramTensorMetadataDependency::TypeAndRank}});
+-      }
+-      if (use_seqlen_k) {
+-        program.AddInputs({{seqlen_k, ProgramTensorMetadataDependency::None}});
+-      }
+-      if (use_seqlens_q) {
+-        program.AddInputs({{seqlens_q, ProgramTensorMetadataDependency::None}});
+-      }
+-      if (has_head_sink) {
+-        program.AddInputs({{head_sink, ProgramTensorMetadataDependency::Type}});
+-      }
+-      program.AddOutputs({{attn_output, ProgramTensorMetadataDependency::TypeAndRank, 4}});
+-      const float alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
+-                                                    : parameters.scale_;
+-
+       // On Apple GPUs, use a larger workgroup size to reduce barrier overhead.
+       const uint32_t prefill_tile_size = is_apple ? 128 : tile_size;
+       const uint32_t num_seq_tile = (parameters.sequence_length_ + prefill_tile_size - 1) / prefill_tile_size;
+-
+-      uint32_t attn_bias_dim0 = 1;
+-      uint32_t attn_bias_dim1 = 1;
+-      uint32_t attn_bias_dim3 = 0;
+-      if (has_attention_bias) {
+-        const auto& bias_shape = attention_bias->Shape();
+-        attn_bias_dim0 = static_cast<uint32_t>(bias_shape[0]);
+-        attn_bias_dim1 = static_cast<uint32_t>(bias_shape[1]);
+-        attn_bias_dim3 = static_cast<uint32_t>(bias_shape[3]);
++      // gpu-slices: one flash-attention dispatch covers every query tile of every
++      // head. On a slow GPU that is seconds of work in one GPU submit, past the
++      // Windows 2 s GPU timeout (docs/LOWMEM.md, Windows GPU). Split it into
++      // slices of whole workgroups, each at most FlashAttentionSliceWork()
++      // query x key x head-size products, each in its own submit. Every
++      // workgroup does the same math, so the output is bit-identical; every GPU
++      // runs the same slices.
++      const uint32_t total_workgroups = parameters.batch_size_ * parameters.num_heads_ * num_seq_tile;
++      const uint64_t work_per_workgroup = std::max<uint64_t>(
++          1, uint64_t{prefill_tile_size} * static_cast<uint64_t>(parameters.total_sequence_length_) *
++                 static_cast<uint64_t>(parameters.head_size_));
++      const uint32_t slice = static_cast<uint32_t>(
++          std::clamp<uint64_t>(FlashAttentionSliceWork() / work_per_workgroup, 1, std::max<uint32_t>(total_workgroups, 1)));
++      for (uint32_t offset = 0; offset < total_workgroups; offset += slice) {
++        const uint32_t count = std::min(slice, total_workgroups - offset);
++        FlashAttentionProgram program{"FlashAttention",
++                                      has_attention_bias,
++                                      is_qualcomm,
++                                      is_fp16,
++                                      parameters.head_size_,
++                                      parameters.num_heads_,
++                                      parameters.is_unidirectional_,
++                                      is_nvidia,
++                                      is_apple,
++                                      has_subgroups,
++                                      q_BNSH,
++                                      use_seqlen_k,
++                                      has_head_sink,
++                                      has_local_window,
++                                      kv_cache_quantization_bits,
++                                      compressed_head_size_u32,
++                                      use_seqlens_q};
++        // When TQ is active, KV cache is u32-packed — use u32 tensor views for present_key/present_value.
++        const Tensor* fa_present_key =
++            kv_cache_quantization_enabled ? quantized_present_key : present_key;
++        const Tensor* fa_present_value =
++            kv_cache_quantization_enabled ? quantized_present_value : present_value;
++        program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                           {fa_present_key, ProgramTensorMetadataDependency::TypeAndRank,
++                            kv_cache_quantization_enabled ? 1 : 4},
++                           {fa_present_value, ProgramTensorMetadataDependency::TypeAndRank,
++                            kv_cache_quantization_enabled ? 1 : 4}});
++        if (has_attention_bias) {
++          program.AddInputs({{attention_bias, ProgramTensorMetadataDependency::TypeAndRank}});
++        }
++        if (use_seqlen_k) {
++          program.AddInputs({{seqlen_k, ProgramTensorMetadataDependency::None}});
++        }
++        if (use_seqlens_q) {
++          program.AddInputs({{seqlens_q, ProgramTensorMetadataDependency::None}});
++        }
++        if (has_head_sink) {
++          program.AddInputs({{head_sink, ProgramTensorMetadataDependency::Type}});
++        }
++        program.AddOutputs({{attn_output, ProgramTensorMetadataDependency::TypeAndRank, 4}});
++        const float alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
++                                                      : parameters.scale_;
++
++
++        uint32_t attn_bias_dim0 = 1;
++        uint32_t attn_bias_dim1 = 1;
++        uint32_t attn_bias_dim3 = 0;
++        if (has_attention_bias) {
++          const auto& bias_shape = attention_bias->Shape();
++          attn_bias_dim0 = static_cast<uint32_t>(bias_shape[0]);
++          attn_bias_dim1 = static_cast<uint32_t>(bias_shape[1]);
++          attn_bias_dim3 = static_cast<uint32_t>(bias_shape[3]);
++        }
++
++        program.SetDispatchGroupSize(count)
++            .SetWorkgroupSize(prefill_tile_size)
++            .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_,
++                       parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple,
++                       has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, has_local_window,
++                       kv_cache_quantization_bits,
++                       compressed_head_size_u32, program.max_k_step(), use_seqlens_q)
++            .AddUniformVariables({{static_cast<uint32_t>(parameters.sequence_length_)},
++                                  {static_cast<uint32_t>(parameters.total_sequence_length_)},
++                                  {static_cast<uint32_t>(present_sequence_length)},
++                                  {static_cast<uint32_t>(parameters.batch_size_)},
++                                  {static_cast<uint32_t>(parameters.n_reps)},
++                                  {alpha},
++                                  {num_seq_tile},
++                                  {attn_bias_dim0},
++                                  {attn_bias_dim1},
++                                  {attn_bias_dim3},
++                                  {static_cast<uint32_t>(has_local_window ? local_window_size : 0)},
++                                  {offset}})
++            .SetOwnSubmit(slice < total_workgroups);
++
++        ORT_RETURN_IF_ERROR(context.RunProgram(program));
+       }
+-
+-      program.SetDispatchGroupSize(parameters.batch_size_ * parameters.num_heads_ * num_seq_tile)
+-          .SetWorkgroupSize(prefill_tile_size)
+-          .CacheHint(has_attention_bias, parameters.head_size_, parameters.num_heads_,
+-                     parameters.is_unidirectional_, is_qualcomm, is_nvidia, is_apple,
+-                     has_subgroups, q_BNSH, use_seqlen_k, has_head_sink, has_local_window,
+-                     kv_cache_quantization_bits,
+-                     compressed_head_size_u32, program.max_k_step(), use_seqlens_q)
+-          .AddUniformVariables({{static_cast<uint32_t>(parameters.sequence_length_)},
+-                                {static_cast<uint32_t>(parameters.total_sequence_length_)},
+-                                {static_cast<uint32_t>(present_sequence_length)},
+-                                {static_cast<uint32_t>(parameters.batch_size_)},
+-                                {static_cast<uint32_t>(parameters.n_reps)},
+-                                {alpha},
+-                                {num_seq_tile},
+-                                {attn_bias_dim0},
+-                                {attn_bias_dim1},
+-                                {attn_bias_dim3},
+-                                {static_cast<uint32_t>(has_local_window ? local_window_size : 0)}});
+-
+-      ORT_RETURN_IF_ERROR(context.RunProgram(program));
      }
 +  } else if (CanApplyFlashAttentionDecodeGQA(parameters, attention_bias, head_sink, use_paged_kv_cache,
 +                                             kv_cache_quantization_enabled, use_seqlens_q, use_indirect_dispatch)) {
@@ -365,10 +575,20 @@ index a800232..f743403 100644
      // Split-reduce path (fused QKV + VxReduce). Handles quantized and unquantized caches.
      const uint32_t num_total_seq_length_tile = (parameters.total_sequence_length_ + tile_size - 1) / tile_size;
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
-index 3e4c16c..a92d688 100644
+index 3e4c16c..d8ec535 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
-@@ -272,6 +272,53 @@ class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionD
+@@ -119,7 +119,8 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
+                                           {"attn_bias_dim0", ProgramUniformVariableDataType::Uint32},
+                                           {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32},
+                                           {"attn_bias_dim3", ProgramUniformVariableDataType::Uint32},
+-                                          {"local_window_size", ProgramUniformVariableDataType::Uint32});
++                                          {"local_window_size", ProgramUniformVariableDataType::Uint32},
++                                          {"workgroup_offset", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   bool has_attention_bias_;
+@@ -272,6 +273,53 @@ class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionD
    bool use_seqlen_k_;
  };
  
@@ -423,7 +643,7 @@ index 3e4c16c..a92d688 100644
  class FlashAttentionPagedDecodeQKVProgram final : public Program<FlashAttentionPagedDecodeQKVProgram> {
   public:
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
-index 962427b..6461a8d 100644
+index 962427b..a5afeaf 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.wgsl.template
 @@ -52,6 +52,14 @@ fn is_key_visible(k_idx: u32, local_window_start: u32, causal_end: u32) -> bool
@@ -471,7 +691,37 @@ index 962427b..6461a8d 100644
    }
  }
   #endif
-@@ -424,14 +432,14 @@ $MAIN {
+@@ -310,7 +318,10 @@ fn fetchVTile(k_idx: u32, vec_idx: u32, v_val: q_value_t) -> q_value_t {
+ #endif
+ 
+ $MAIN {
+-  let batch_head_idx = u32(workgroup_idx / uniforms.num_seq_tile);
++  // gpu-slices: the prefill dispatch is split into slices of whole workgroups
++  // (flash_attention.cc); workgroup_offset is this slice's first workgroup.
++  let wg_idx = workgroup_idx + uniforms.workgroup_offset;
++  let batch_head_idx = u32(wg_idx / uniforms.num_seq_tile);
+   let head_idx = batch_head_idx % num_heads;
+   let batch_idx = batch_head_idx / num_heads;
+ 
+@@ -326,7 +337,7 @@ $MAIN {
+ #endif
+ 
+   // Load Q
+-  let query_tile_start = (workgroup_idx % uniforms.num_seq_tile) * workgroup_size_x;
++  let query_tile_start = (wg_idx % uniforms.num_seq_tile) * workgroup_size_x;
+   let q_idx_global = query_tile_start + local_idx;
+   let valid_q = q_idx_global < uniforms.new_sequence_length;
+   if (valid_q) {
+@@ -359,7 +370,7 @@ $MAIN {
+                                     total_sequence_length <= uniforms.new_sequence_length);
+ #endif
+   let max_causal_len_for_workgroup = past_sequence_length +
+-                                     (workgroup_idx % uniforms.num_seq_tile + 1) * workgroup_size_x;
++                                     (wg_idx % uniforms.num_seq_tile + 1) * workgroup_size_x;
+   let loop_bound = min(total_sequence_length, max_causal_len_for_workgroup);
+   let seq_causal_length = past_sequence_length + q_idx_global + 1;
+ #else
+@@ -424,14 +435,14 @@ $MAIN {
      }
      previous_max = new_max;
      previous_denom = d;
@@ -490,7 +740,7 @@ index 962427b..6461a8d 100644
      }
    }
  
-@@ -563,11 +571,15 @@ $MAIN {
+@@ -563,11 +574,15 @@ $MAIN {
      }
      previous_max = new_max;
      previous_denom = d;
@@ -506,7 +756,7 @@ index 962427b..6461a8d 100644
  
   #if is_qualcomm
      if (sg_size > 8) {
-@@ -653,22 +665,22 @@ $MAIN {
+@@ -653,22 +668,22 @@ $MAIN {
    #else
          var val = q_value_t(0);
    #endif
@@ -545,7 +795,7 @@ index 962427b..6461a8d 100644
          o_tile[i] = o_tile[i] * o_ratio + sum;
        }
      } else {
-@@ -678,14 +690,14 @@ $MAIN {
+@@ -678,14 +693,14 @@ $MAIN {
    #else
          var val = q_value_t(0);
    #endif
@@ -1494,7 +1744,7 @@ index 49b51d3..776af50 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..43845ff 100644
+index 45baa67..46310f7 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -112,6 +112,39 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -1659,6 +1909,22 @@ index 45baa67..43845ff 100644
                                                                   K,
                                                                   block_size,
                                                                   nbits,
+@@ -318,6 +444,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+                                  {num_M_tile},
+                                  {weight_index}});
+     program.CacheHint(nbits, has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, subgroup_min_size);
++    program.SetOwnSubmit(static_cast<uint64_t>(batch_count) * M * N * K >= onnxruntime::webgpu::OwnSubmitMatMulWork());
+ 
+     return context.RunProgram(program);
+   }
+@@ -363,6 +490,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+   if (has_weight_idx_indirect) {
+     program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
+   }
++  program.SetOwnSubmit(static_cast<uint64_t>(batch_count) * M * N * K >= onnxruntime::webgpu::OwnSubmitMatMulWork());
+   return context.RunProgram(program);
+ }
+ 
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
 index bf56d4f..ef71563 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
@@ -2416,7 +2682,7 @@ index b762c38..19b29d1 100644
        << "}\n";
    return Status::OK();
 diff --git a/onnxruntime/core/providers/webgpu/math/matmul.cc b/onnxruntime/core/providers/webgpu/math/matmul.cc
-index 6515757..7ade01d 100644
+index 6515757..6b43ab8 100644
 --- a/onnxruntime/core/providers/webgpu/math/matmul.cc
 +++ b/onnxruntime/core/providers/webgpu/math/matmul.cc
 @@ -156,6 +156,17 @@ Status MatMul::ComputeInternal(ComputeContext& context) const {
@@ -2474,6 +2740,14 @@ index 6515757..7ade01d 100644
      const SplitKConfig& split_k_config = context->GetSplitKConfig();
      const bool need_split_k = split_k_config.UseSplitK(
          is_vec4, activation.activation_kind_, batch_size, dim_a_outer, dim_b_outer,
+@@ -333,6 +345,7 @@ Status ComputeMatMul(ComputeContext* context,
+       .AddOutput(std::move(output));
+   // Activation uniforms must remain last because definitions and values are matched by index.
+   AppendActivationUniformsData(activation, matmul_program);
++  matmul_program.SetOwnSubmit(static_cast<uint64_t>(batch_size) * dim_a_outer * dim_b_outer * dim_inner >= OwnSubmitMatMulWork());
+ 
+   if (use_bias_in_matmul) {
+     auto bias_components = is_channels_last ? components : 1;
 diff --git a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc b/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
 index b303182..85903e3 100644
 --- a/onnxruntime/core/providers/webgpu/nn/layer_norm.cc
@@ -2510,6 +2784,58 @@ index 250b115..871ecc4 100644
  
    // Reuse LayerNormProgram with simplified=true, has_bias=false, no mean output
    LayerNormProgram program{/*has_bias=*/false, /*simplified=*/true, /*has_mean_output=*/false,
+diff --git a/onnxruntime/core/providers/webgpu/program.h b/onnxruntime/core/providers/webgpu/program.h
+index e1b3d04..e0d9f33 100644
+--- a/onnxruntime/core/providers/webgpu/program.h
++++ b/onnxruntime/core/providers/webgpu/program.h
+@@ -279,6 +279,16 @@ struct ProgramMetadata {
+   gsl::span<const ProgramUniformVariableDefinition> uniform_variables;
+ };
+ 
++// gpu-slices: a matmul dispatch with at least this many multiply-adds is
++// submitted on its own (ProgramBase::SetOwnSubmit), so its neighbours never
++// pile onto it in one long GPU submit on a slow GPU. 2^31 is about 30 ms of
++// fp16 matmul on an Intel gen-9 laptop GPU (the slow reference) and under 2 ms
++// on an Apple M5. The same on every GPU.
++constexpr uint64_t kOwnSubmitMatMulWork = uint64_t{1} << 31;
++// The threshold in use: kOwnSubmitMatMulWork, or for a measurement only
++// globalThis.ortWebGpuOwnSubmitMatMulWork (webgpu_context.cc).
++uint64_t OwnSubmitMatMulWork();
++
+ class ProgramBase {
+  public:
+   //
+@@ -292,6 +302,14 @@ class ProgramBase {
+     return *this;
+   }
+ 
++  // gpu-slices: submit this dispatch on its own (the dispatches before it are
++  // submitted first). For long dispatches, so no single GPU submit runs long on
++  // a slow GPU; the same on every GPU.
++  ProgramBase& SetOwnSubmit(bool own_submit = true) {
++    own_submit_ = own_submit;
++    return *this;
++  }
++
+   // add a program input
+   ProgramBase& AddInput(ProgramInput&& input);
+   // add multiple program inputs
+@@ -365,6 +383,7 @@ class ProgramBase {
+   inline uint32_t DispatchGroupSizeY() const { return dispatch_group_size_y_; }
+   inline uint32_t DispatchGroupSizeZ() const { return dispatch_group_size_z_; }
+   inline const Tensor* IndirectDispatchTensor() const { return indirect_dispatch_tensor_; }
++  inline bool OwnSubmit() const { return own_submit_; }
+   inline uint32_t WorkgroupSizeX() const { return workgroup_size_x_; }
+   inline uint32_t WorkgroupSizeY() const { return workgroup_size_y_; }
+   inline uint32_t WorkgroupSizeZ() const { return workgroup_size_z_; }
+@@ -393,6 +412,7 @@ class ProgramBase {
+   uint32_t dispatch_group_size_z_;
+ 
+   const Tensor* indirect_dispatch_tensor_;
++  bool own_submit_ = false;
+ 
+   uint32_t workgroup_size_x_;
+   uint32_t workgroup_size_y_;
 diff --git a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc b/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
 index 5658cca..4d8cf38 100644
 --- a/onnxruntime/core/providers/webgpu/reduction/reduction_ops.cc
@@ -2645,10 +2971,68 @@ index 8bb53e4..a608ba1 100644
  
        shader.MainFunctionBody() << "let output_indices" << x << " = " << output_indices.OffsetToIndices("global_idx * 4 + " + x) << ";\n"
 diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.cc b/onnxruntime/core/providers/webgpu/webgpu_context.cc
-index ff85ff9..3e5e454 100644
+index ff85ff9..020ee80 100644
 --- a/onnxruntime/core/providers/webgpu/webgpu_context.cc
 +++ b/onnxruntime/core/providers/webgpu/webgpu_context.cc
-@@ -222,12 +222,22 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
+@@ -1,6 +1,9 @@
+ // Copyright (c) Microsoft Corporation. All rights reserved.
+ // Licensed under the MIT License.
+ 
++#if defined(__wasm__)
++#include <emscripten.h>
++#endif
+ #include <algorithm>
+ #include <cmath>
+ #include <memory>
+@@ -47,6 +50,20 @@
+ namespace onnxruntime {
+ namespace webgpu {
+ 
++uint64_t OwnSubmitMatMulWork() {
++  static const uint64_t work = [] {
++#if defined(__wasm__)
++    const double v = EM_ASM_DOUBLE({
++      const v = globalThis['ortWebGpuOwnSubmitMatMulWork'];  // quoted: the glue is minified
++      return typeof v === 'number' && v > 0 ? v : 0;
++    });
++    if (v > 0) return static_cast<uint64_t>(v);
++#endif
++    return kOwnSubmitMatMulWork;
++  }();
++  return work;
++}
++
+ #if !defined(__wasm__) && !defined(USE_EXTERNAL_DAWN)
+ namespace {
+ 
+@@ -77,6 +94,26 @@ DawnPlatform& GetDawnPlatform() {
+ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
+   std::call_once(init_flag_, [this, &config]() {
+     max_num_pending_dispatches_ = config.max_num_pending_dispatches;
++#if defined(__wasm__)
++    // Diagnostic only: ORT web cannot pass maxNumPendingDispatches (it builds
++    // this context before it reads session config), so a page may set
++    // globalThis.ortWebGpuMaxPendingDispatches (?gpuTrace&gpuSubmit=N).
++    if (const int override_pending = EM_ASM_INT({
++          const v = globalThis['ortWebGpuMaxPendingDispatches'];  // quoted: the glue is minified
++          return Number.isInteger(v) && v > 0 && v <= 4096 ? v : 0;
++        });
++        override_pending > 0) {
++      max_num_pending_dispatches_ = static_cast<uint32_t>(override_pending);
++    }
++    // Diagnostic only: globalThis.ortWebGpuSubmitsInFlight (0 = no bound).
++    if (const int override_in_flight = EM_ASM_INT({
++          const v = globalThis['ortWebGpuSubmitsInFlight'];
++          return Number.isInteger(v) && v >= 0 && v <= 4096 ? v + 1 : 0;
++        });
++        override_in_flight > 0) {
++      max_submits_in_flight_ = static_cast<uint32_t>(override_in_flight - 1);
++    }
++#endif
+     enable_robustness_ = config.enable_robustness;
+ 
+     // Three easily-conflated concepts, at three layers (a pipeline, not the same flag):
+@@ -222,12 +259,22 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
        device_limits_.maxStorageBufferBindingSize -=
            (device_limits_.maxStorageBufferBindingSize % device_limits_.minStorageBufferOffsetAlignment);
      }
@@ -2671,7 +3055,7 @@ index ff85ff9..3e5e454 100644
      // cache adapter info
      if (DeviceHasFeature(wgpu::FeatureName::ChromiumExperimentalSubgroupMatrix)) {
        adapter_info_.nextInChain = &subgroup_matrix_configs_;
-@@ -252,7 +262,7 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
+@@ -252,7 +299,7 @@ void WebGpuContext::Initialize(const WebGpuContextConfig& config) {
      program_mgr_ = std::make_unique<ProgramManager>(*this);
  
      // create split-k config
@@ -2680,7 +3064,27 @@ index ff85ff9..3e5e454 100644
  
      // set query type
  #if !defined(__wasm__)
-@@ -794,11 +804,10 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
+@@ -718,12 +765,17 @@ Status WebGpuContext::Run(ComputeContextBase& context, const ProgramBase& progra
+     command.pending_kernel_info.emplace(context.NodeName(), context.OpType(), program.Name(),
+                                         key, inputs, outputs);
+   }
++  // gpu-slices: an own-submit program goes in a submit of its own.
++  const bool own_submit = program.OwnSubmit() && graph_capture_state_ == GraphCaptureState::Default;
++  if (own_submit && static_cast<size_t>(num_pending_dispatches_) + deferred_dispatches_.size() > 0) {
++    ORT_RETURN_IF_ERROR(Flush(buffer_mgr));
++  }
+   deferred_dispatches_.push_back(std::move(command));
+ 
+   // Drain and submit a full window to bound both recorded and encoded dispatch state. Partial
+   // windows are encoded and submitted by the caller at its execution boundary.
+-  if (static_cast<size_t>(num_pending_dispatches_) + deferred_dispatches_.size() >=
+-      max_num_pending_dispatches_) {
++  if (own_submit || static_cast<size_t>(num_pending_dispatches_) + deferred_dispatches_.size() >=
++                        max_num_pending_dispatches_) {
+     ORT_RETURN_IF_ERROR(Flush(buffer_mgr));
+   }
+   return Status::OK();
+@@ -794,11 +846,10 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
  #if !defined(__wasm__)
        wgpu::FeatureName::ChromiumExperimentalTimestampQueryInsidePasses,
  #endif
@@ -2694,7 +3098,7 @@ index ff85ff9..3e5e454 100644
  #if !defined(__wasm__)
        wgpu::FeatureName::BufferMapExtendedUsages,
  #endif
-@@ -811,15 +820,31 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
+@@ -811,15 +862,31 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
    return required_features;
  }
  
@@ -2730,11 +3134,44 @@ index ff85ff9..3e5e454 100644
  
    if (max_storage_buffer_binding_size_ == 0) {
      // If not set by the user, use the adapter limit.
+@@ -1051,6 +1118,24 @@ Status WebGpuContext::Flush(const webgpu::BufferManager& buffer_mgr) {
+   }
+   current_command_encoder_ = nullptr;
+   num_pending_dispatches_ = 0;
++
++  // gpu-slices: at most max_submits_in_flight_ submits may wait in the GPU
++  // queue. ORT records a whole run at once; on a slow GPU that queued seconds
++  // of work, and Chrome's own drawing of the page waited behind all of it
++  // (133 s during Small's vision stage on an Intel gen-9 laptop). With a
++  // bound, other GPU work waits at most a few submits. A fixed number, the
++  // same on every GPU (webgpu_context.h).
++  if (max_submits_in_flight_ > 0 && graph_capture_state_ == GraphCaptureState::Default) {
++    submits_in_flight_.push_back(device_queue_.OnSubmittedWorkDone(
++        wgpu::CallbackMode::WaitAnyOnly, [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}));
++    while (submits_in_flight_.size() > max_submits_in_flight_) {
++      Status wait_status = Wait(submits_in_flight_.front());
++      submits_in_flight_.pop_front();
++      if (!wait_status.IsOK() && status.IsOK()) {
++        status = wait_status;
++      }
++    }
++  }
+   return status;
+ }
+ 
 diff --git a/onnxruntime/core/providers/webgpu/webgpu_context.h b/onnxruntime/core/providers/webgpu/webgpu_context.h
-index 1790c85..80a11b2 100644
+index 1790c85..4bad665 100644
 --- a/onnxruntime/core/providers/webgpu/webgpu_context.h
 +++ b/onnxruntime/core/providers/webgpu/webgpu_context.h
-@@ -221,7 +221,12 @@ class WebGpuContext final {
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <deque>
+ #include <memory>
+ #include <mutex>
+ #include <optional>
+@@ -221,7 +222,12 @@ class WebGpuContext final {
    const wgpu::Instance& Instance() const { return instance_; }
    const wgpu::Device& Device() const { return device_; }
  
@@ -2748,7 +3185,7 @@ index 1790c85..80a11b2 100644
    const wgpu::Limits& DeviceLimits() const { return device_limits_; }
    bool DeviceHasFeature(wgpu::FeatureName feature) const { return device_features_.contains(feature); }
    const wgpu::AdapterPropertiesSubgroupMatrixConfigs& SubgroupMatrixConfigs() const { return subgroup_matrix_configs_; }
-@@ -367,6 +372,7 @@ class WebGpuContext final {
+@@ -367,6 +373,7 @@ class WebGpuContext final {
    std::vector<const char*> GetDisabledDeviceToggles() const;
    std::vector<wgpu::FeatureName> GetAvailableRequiredFeatures(const wgpu::Adapter& adapter) const;
    wgpu::Limits GetRequiredLimits(const wgpu::Adapter& adapter) const;
@@ -2756,7 +3193,7 @@ index 1790c85..80a11b2 100644
    void WriteTimestamp(uint32_t query_index);
  
    struct PendingQueryInfo {
-@@ -400,6 +406,7 @@ class WebGpuContext final {
+@@ -400,6 +407,7 @@ class WebGpuContext final {
  
    wgpu::Queue device_queue_;
    wgpu::AdapterInfo adapter_info_;
@@ -2764,6 +3201,21 @@ index 1790c85..80a11b2 100644
    wgpu::Limits device_limits_;
    std::unordered_set<wgpu::FeatureName> device_features_;
    wgpu::AdapterPropertiesSubgroupMatrixConfigs subgroup_matrix_configs_;
+@@ -413,6 +421,14 @@ class WebGpuContext final {
+ 
+   uint32_t num_pending_dispatches_ = 0;
+   uint32_t max_num_pending_dispatches_ = 16;
++  // gpu-slices: GPU submits still running, oldest first (Flush). At most
++  // max_submits_in_flight_ may be open; then Flush waits for the oldest. 16 on
++  // every GPU: on the Intel gen-9 reference laptop Chrome's own GPU work then
++  // waits at most ~75 ms (133 s with no bound) and Small's page costs ~2% more
++  // at imageBudget 1120; a bound of 2 or 8 cost 31-37% at imageBudget 280
++  // (each wait for a work-done notification costs ~55 ms there).
++  std::deque<wgpu::Future> submits_in_flight_;
++  uint32_t max_submits_in_flight_ = 16;
+ 
+   // Owns the active dispatch window and the unique pending builds referenced within that window.
+   std::vector<webgpu::CapturedCommandInfo> deferred_dispatches_;
 diff --git a/onnxruntime/wasm/post-webgpu.js b/onnxruntime/wasm/post-webgpu.js
 index 09e7ee7..85ee63b 100644
 --- a/onnxruntime/wasm/post-webgpu.js

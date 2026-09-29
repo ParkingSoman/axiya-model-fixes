@@ -786,10 +786,11 @@ attention dispatch (M5 ~137 ms) takes about 6.6 s on the HP.
 The page's frame-gap probe (rAF) saw 18 ms gaps while 400 ms GPU submits ran,
 so it cannot see this lag; screenshots of the HP are the evidence instead.
 
-### Phase 2 in progress: slices, own submits, and a bound on submits in flight
+### Phase 2: slices, own submits, and a bound on submits in flight
 
-Fork branch `gpu-slices` (from `gpu-f16-read`; experimental, not pinned; the
-pinned default is still `ort-fork-dist-f16r`):
+Fork branch `gpu-slices` (from `gpu-f16-read`). Pinned on 2026-09-29 at
+54634e0 (dist `ort-fork-dist-slices`); see "Phase 2 result" below. The
+checkpoint notes that follow are kept as written:
 
 | Commit | Change |
 |---|---|
@@ -818,3 +819,50 @@ One attention workgroup at 1120 walks all 10080 keys (~190 ms on the HP), so
 no slice can be shorter without changing the reduction order (not allowed:
 exact output). The plan's 50 ms target is replaced by the GPU wait number the
 user accepts.
+
+### Phase 2 result (2026-09-29): pinned, no measurable cost on the Mac
+
+The final constants are the same on every GPU:
+
+| Constant | Value |
+|---|---|
+| Flash-attention slice | 2^32 query·key·head-size products, own submit |
+| Matmul own submit | 2^31 multiply-adds or more |
+| Submits in flight | 16 |
+
+The "Mac cost" measured earlier was a measuring error. The vision and prefill
+walls end when `run()` returns, and `run()` returns before the GPU finishes
+when ORT queues work ahead. A Dawn trace (`CATS=... app-trace.mjs`) and a
+macOS `sample` of Chrome's GPU process show this:
+
+- At 4 dispatches per submit, Chrome's GPU main thread waits 8.1 s in
+  `-[MTLCommandQueue commandBuffer]` for one of Metal's 64 command-buffer
+  slots. So the GPU is the bottleneck, and Chrome only waits for it.
+- In 0.5 s buckets, the GPU is busy from vision start to prefill end at both
+  16 and 4 dispatches per submit.
+
+The honest measure is the Convert click to "page done" (`app-ab.mjs`,
+`pageMs`; headless Chrome on the M5, Small, `scan-mathfuncs.pdf`):
+
+| Build | Round 1 | Round 2 |
+|---|---|---|
+| Pinned f16r | 73.1 s | 71.0 s |
+| gpu-slices, final constants | 75.0 s | 71.0 s |
+| gpu-slices, all splitters and the bound off, 16 per submit | 69.8 s | 71.1 s |
+| same, 4 per submit | 71.0 s | 71.4 s |
+
+The differences stay inside the run-to-run noise. The HP "vision wall" costs
+in the table above have the same flaw.
+
+Research (2026-09-29): Windows resets the GPU when the driver cannot pause the
+work within about 2 s. The driver decides where it can pause (between submits,
+between dispatches, or finer), and this differs by machine. The only pause
+point that every driver respects is a submit boundary, so the slices keep
+their own submits. Sources: Microsoft's TDR and GPU preemption pages. Other
+browser runtimes use a fixed count of dispatches per submit (ORT 16, TF.js 15,
+TVM 32, llama.cpp 64). None of them splits one long dispatch. WebLLM has an
+open hang report on an Intel UHD 630 (web-llm #489).
+
+Gates on the M5 with the pinned slices dist: `lowmem-batchinv.html?model=e4b`
+528/528, `lowmem-batchinv.html` (12B) 92/92, `npm test` 1196 pass.
+
