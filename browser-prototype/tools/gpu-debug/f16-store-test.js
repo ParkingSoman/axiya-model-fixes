@@ -91,6 +91,15 @@ try {
   };
   await wgTest('K18_workgroupFromVec2', 'var<storage, read> x : array<vec2<f16>>', 'x[g.x / 2u - l / 2u + l]');
   await wgTest('K19_workgroupFromU32', 'var<storage, read> x : array<u32>', 'bitcast<vec2<f16>>(x[g.x / 2u - l / 2u + l])');
+  // Work-done latency on an idle queue: submit nothing, time onSubmittedWorkDone.
+  const latency = [];
+  for (let i = 0; i < 20; i++) {
+    const t = performance.now();
+    device.queue.submit([device.createCommandEncoder().finish()]);
+    await device.queue.onSubmittedWorkDone();
+    latency.push(+(performance.now() - t).toFixed(2));
+  }
+  result.workDoneLatencyMs = latency;
 } catch (error) { result.error = String(error?.stack ?? error); }
 out.textContent = JSON.stringify(result, null, 1);
 if (post) fetch('/__gpu-trace', {method: 'POST', headers: {'content-type': 'text/plain'}, body: 'F16TEST ' + JSON.stringify(result)}).catch(() => {});
