@@ -785,3 +785,36 @@ attention dispatch (M5 ~137 ms) takes about 6.6 s on the HP.
 
 The page's frame-gap probe (rAF) saw 18 ms gaps while 400 ms GPU submits ran,
 so it cannot see this lag; screenshots of the HP are the evidence instead.
+
+### Phase 2 in progress: slices, own submits, and a bound on submits in flight
+
+Fork branch `gpu-slices` (from `gpu-f16-read`; experimental, not pinned; the
+pinned default is still `ort-fork-dist-f16r`):
+
+| Commit | Change |
+|---|---|
+| c81b25e | flash-attention prefill split into slices of whole workgroups, at most 2^31 query·key·head-size products each, each in its own submit (`ProgramBase::SetOwnSubmit`). Output bit-identical (M5 taps 147/147). |
+| 8f7b7a9 | `MatMul` and `MatMulNBits` dispatches with at least 2^31 multiply-adds submitted on their own |
+| 0197db4 | diagnostic overrides read with quoted names (the ORT glue is Closure-minified; unquoted `globalThis` names were renamed, so earlier override runs were invalid) |
+| 4f78d42 | `Flush` waits for the oldest submit when more than 2 are in flight |
+
+Page flags (measurement only): `?gpuSliceLog2=N`, `?gpuInFlight=N`,
+`?gpuSubmit=N`. The page's GPU wait probe (a canvas readback every 2 s) shows
+how long Chrome's own GPU work waits.
+
+| HP, Small | Pinned f16r | gpu-slices 4f78d42 |
+|---|---|---|
+| 1120 | `DEVICE_HUNG` in vision | no loss; longest submit 390 ms (bound not yet tested at 1120) |
+| 560 vision wall (unprofiled) | 20.5 s | 37.4-37.7 s |
+| 560 GPU wait, model load | 11.8 s | 20 ms |
+| 560 GPU wait, vision | 19.9-32.7 s (133 s at 1120) | 46-59 ms |
+
+Profiled runs are excluded from the cost attribution: timestamp queries at
+every pass boundary cost 1.8x on the HP by themselves (pinned f16r profiled at
+560: 36.3 s). Unprofiled: attention slices alone +11 s, all splitters +17 s,
+not additive; the cause is not identified yet.
+
+One attention workgroup at 1120 walks all 10080 keys (~190 ms on the HP), so
+no slice can be shorter without changing the reduction order (not allowed:
+exact output). The plan's 50 ms target is replaced by the GPU wait number the
+user accepts.
