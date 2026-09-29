@@ -210,6 +210,20 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'var->packed_f16_input_ = is_input &&' onnxruntime/core/providers/webgpu/shader_helper.cc &&
     grep -q 'a_input.GetByOffset("index_a" + x)' onnxruntime/core/providers/webgpu/tensor/where.cc || {
       echo "reference patch lacks the F16R float16 read path (gpu-f16-read); refusing" >&2; exit 1; }
+  # SLC (gpu-slices): no GPU submit runs long and few wait in the queue, so a
+  # slow GPU stays under the Windows 2 s GPU timeout and Chrome can draw the
+  # page (docs/LOWMEM.md, Windows GPU). Flash-attention prefill in slices of
+  # 2^32 products, each its own submit; matmuls of 2^31+ multiply-adds submit
+  # alone; at most 16 submits in flight.
+  fa=onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
+  grep -q 'constexpr uint64_t kFlashAttentionSliceWork = uint64_t{1} << 32;' $fa &&
+    grep -q '.SetOwnSubmit(slice < total_workgroups);' $fa &&
+    grep -q 'constexpr uint64_t kOwnSubmitMatMulWork = uint64_t{1} << 31;' onnxruntime/core/providers/webgpu/program.h &&
+    grep -q 'matmul_program.SetOwnSubmit(' onnxruntime/core/providers/webgpu/math/matmul.cc &&
+    [ "$(grep -c 'program.SetOwnSubmit(' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc)" = 2 ] &&
+    grep -q 'uint32_t max_submits_in_flight_ = 16;' onnxruntime/core/providers/webgpu/webgpu_context.h &&
+    grep -q 'while (submits_in_flight_.size() > max_submits_in_flight_)' onnxruntime/core/providers/webgpu/webgpu_context.cc || {
+      echo "reference patch lacks the SLC submit bounds (gpu-slices); refusing" >&2; exit 1; }
 fi
 git add -N onnxruntime   # so the stat below lists new files too
 git diff --stat
