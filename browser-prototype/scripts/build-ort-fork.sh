@@ -14,13 +14,16 @@
 #     global-layer k_norm is one row of 512 at S = 1.
 #   - MatMulNBits, 1-16 rows (K4): one pipeline per path, DP4A (int8
 #     activations) where one-token steps use DP4A, else float (float32 or
-#     float16); each weight is read once per tile of up to 16 rows. One-token
-#     steps use it too. DP4A keeps the rows in a runtime loop. The float
-#     kernel (PK) keeps 16 row accumulators in registers, each row updated by
-#     its own inlined copy of one helper function, so an extra row costs about
-#     1/16 of a weight pass instead of almost a whole one (k = 16 pass: 6.6 ->
-#     2.5 plain steps on the M5). Bit identity across those row copies is
-#     verified on the Apple M5 only. Other 2-16-row cases run the one-row
+#     float16); each weight is read once per tile of rows. One-token steps
+#     use it too. DP4A keeps the rows in a runtime loop. The float kernel (PK,
+#     tile9) keeps up to 9 row accumulators in registers, each row updated by
+#     its own inlined copy of one helper function; rows 10-16 take a second
+#     tile. 16 accumulators spilled on Intel gen-9 (GLM-OCR decode step 227 ->
+#     144 ms with 9). Bit identity across those row copies is verified on the
+#     Apple M5 (gates e4b 528/528, 12B 92/92).
+#   - Flash-attention prefill with 32-bit inputs steps 8 keys at a time
+#     (tile9k8): fewer private registers per thread; the GLM-OCR image reader
+#     ran 2.2x faster on Intel gen-9. 16-bit inputs (Gemma) keep their step. Other 2-16-row cases run the one-row
 #     float program per row, never the prefill tile kernels.
 #   - CausalConvWithState with state_window (K5): the WebGPU kernel keeps the
 #     conv state after each of the last W positions (W <= 16), so a speculative
@@ -149,8 +152,8 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
       echo "reference patch lacks the K3 attention/norm changes; refusing" >&2; exit 1; }
   # K4: MatMulNBits for 1-16 rows runs through one pipeline per path (DP4A or
   # float), and 2-16 rows never reach the prefill tile kernels. DP4A keeps the
-  # rows in a runtime loop; the float kernel (PK) has 16 register accumulators,
-  # one inlined row_sums copy per row.
+  # rows in a runtime loop; the float kernel (PK, tile9) has up to 9 register
+  # accumulators per tile, one inlined row_sums copy per row.
   grep -q 'const bool batchable = M >= 1 && M <= kMaxBatchedM' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'ApplyDP4AMatMulNBitsBatched(a, b, scales' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
     grep -q 'if (!small_m && CanApplySubgroupMatrixMatMulNBits' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc &&
@@ -159,9 +162,12 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q '^#define ORT_FORK_FUSED_DECODE [01]$' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_nbits.h &&
     grep -q 'ORT_FORK_FUSED_DECODE != 0 &&' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc &&
     grep -q 'M != 1 || ORT_FORK_FUSED_DECODE == 0' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_qkv.cc &&
-    grep -q 'acc15 += row_sums(a_base + 15u \* K_of_a, w,' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
+    grep -q 'acc8 += row_sums(a_base + 8u \* K_of_a, w,' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template &&
     grep -q 'for (var m = 0u; m < rows; m++) {' onnxruntime/contrib_ops/webgpu/quantization/dp4a_matmul_batched.wgsl.template || {
       echo "reference patch lacks the K4 batched MatMulNBits kernels; refusing" >&2; exit 1; }
+  # tile9k8: 32-bit flash-attention prefill steps 8 keys at a time.
+  grep -A1 -F 'if (!is_fp16) {' onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc | grep -q 'return 8;' || {
+      echo "reference patch lacks the f32 attention key step 8 (tile9k8); refusing" >&2; exit 1; }
   # K5: CausalConvWithState state window on WebGPU, up to 16 slots.
   grep -q 'constexpr int64_t kMaxStateWindow = 16;' onnxruntime/contrib_ops/cpu/bert/attention_common.h &&
     grep -q 'ParseStateWindow(info, state_window_)' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc &&

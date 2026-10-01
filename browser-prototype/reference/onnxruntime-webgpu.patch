@@ -215,7 +215,7 @@ index 1f95a2f..3deb391 100644
          let ip = vp - state_length;
          state_val = input[input_base + ip * input_pos_stride];
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
-index a800232..c73d6b1 100644
+index a800232..21b63a0 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 @@ -16,6 +16,12 @@ using namespace ::onnxruntime::common;
@@ -231,7 +231,40 @@ index a800232..c73d6b1 100644
  namespace onnxruntime {
  namespace contrib {
  namespace webgpu {
-@@ -309,6 +315,27 @@ Status PrepareIndirectDispatchProgram::GenerateShaderCode(ShaderHelper& shader)
+@@ -59,6 +65,16 @@ constexpr int SelectDensePrefillMaxKStep(bool use_shm_path, bool is_fp16, int he
+     return 16;
+   }
+ 
++  // 32-bit inputs: 8 keys per step. Each thread keeps its query, its f32
++  // output and one score per key of the step in private memory; with 32 keys
++  // the scores alone add 32 registers to 128. Key step 8 ran the GLM-OCR image
++  // reader's attention (16 heads x 64, 2464 tokens, f32) 2.2x faster on an
++  // Intel gen-9 GPU (1062 -> 484 ms per layer) and 1.3-2x faster on the Apple
++  // M5 (attn-glm-bench.html, OCR spike). Same math; the online-softmax rescale
++  // points move, so the last bits may differ. 16-bit inputs keep the step below.
++  if (!is_fp16) {
++    return 8;
++  }
+   // Preserve the existing tile selection, which targets the guaranteed WebGPU
+   // workgroup-storage budget even when the device exposes a higher limit.
+   const int element_size = is_fp16 ? 2 : 4;
+@@ -95,9 +111,13 @@ constexpr bool DensePrefillFitsWorkgroupStorage(bool use_shm_path,
+          max_workgroup_storage_size;
+ }
+ 
+-static_assert(!DensePrefillFitsWorkgroupStorage(true, false, 256, 8, false, 64, 16384));
++// f32 head 256 at key step 8 fills exactly 16 KB; the 4-bit cache's lookup
++// table (64 bytes) puts it over.
++static_assert(DensePrefillFitsWorkgroupStorage(true, false, 256, 8, false, 64, 16384));
++static_assert(!DensePrefillFitsWorkgroupStorage(true, false, 256, 4, false, 64, 16384));
+ static_assert(DensePrefillFitsWorkgroupStorage(true, false, 256, 8, false, 64, 32768));
+-static_assert(!DensePrefillFitsWorkgroupStorage(true, false, 128, 4, false, 64, 16384));
++// f32 head 128 at key step 8: 8 KB of tiles plus the 64-byte table fit.
++static_assert(DensePrefillFitsWorkgroupStorage(true, false, 128, 4, false, 64, 16384));
+ static_assert(DensePrefillFitsWorkgroupStorage(true, true, 128, 0, false, 64, 16384));
+ static_assert(DensePrefillFitsWorkgroupStorage(false, true, 128, 0, false, 64, 16384));
+ static_assert(!DensePrefillFitsWorkgroupStorage(true, true, 128, 8, true, 64, 16384));
+@@ -309,6 +329,27 @@ Status PrepareIndirectDispatchProgram::GenerateShaderCode(ShaderHelper& shader)
    return Status::OK();
  }
  
@@ -259,7 +292,7 @@ index a800232..c73d6b1 100644
  Status CopyKVCache(onnxruntime::webgpu::ComputeContext& context, const WebgpuAttentionParameters& parameters,
                     const Tensor* K, const Tensor* past_key, Tensor* present_key,
                     const Tensor* V, const Tensor* past_value, Tensor* present_value,
-@@ -919,6 +946,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
+@@ -919,6 +960,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
    return context.RunProgram(program);
  }
  
@@ -393,7 +426,7 @@ index a800232..c73d6b1 100644
  Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
                             Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
                             const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context, const Tensor* seqlen_k,
-@@ -1288,84 +1442,107 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+@@ -1288,84 +1456,107 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
        bool is_fp16 = is_fp16_q;
        bool q_BNSH = parameters.qkv_format_ == Q_K_V_BNSH;
        bool has_head_sink = head_sink != nullptr;
@@ -1744,7 +1777,7 @@ index 49b51d3..776af50 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..46310f7 100644
+index 45baa67..08b1b37 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 @@ -112,6 +112,39 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
@@ -1764,10 +1797,10 @@ index 45baa67..46310f7 100644
 +  const auto& output = shader.AddOutput("output", ShaderUsage::UseElementTypeAlias);
 +  ORT_ENFORCE(a.NumComponents() == 4, "MatMulNBitsBatched needs K % 4 == 0.");
 +  ORT_ENFORCE(WorkgroupSizeX() == col_groups_ * k_lanes_, "workgroup size must be col_groups * k_lanes.");
-+  // The template has 16 explicit row accumulators (vec4: 4 columns per
++  // The template has 9 explicit row accumulators (vec4: 4 columns per
 +  // thread) and reduces 4 rows at a time.
-+  ORT_ENFORCE(tile_rows_ == 16 && reduce_rows_ == 4 && cols_per_thread_ == 4,
-+              "MatMulNBitsBatched needs tile_rows 16, reduce_rows 4 and cols_per_thread 4.");
++  ORT_ENFORCE(tile_rows_ == 9 && reduce_rows_ == 4 && cols_per_thread_ == 4,
++              "MatMulNBitsBatched needs tile_rows 9, reduce_rows 4 and cols_per_thread 4.");
 +
 +  return WGSL_TEMPLATE_APPLY(shader, "quantization/matmul_nbits_batched.wgsl.template",
 +                             WGSL_TEMPLATE_PARAMETER(col_groups, col_groups_),
@@ -1787,7 +1820,7 @@ index 45baa67..46310f7 100644
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +255,102 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -222,9 +255,104 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -1799,14 +1832,14 @@ index 45baa67..46310f7 100644
 +  // kernels would not do: Metal compiles WebGPU shaders in relaxed math mode,
 +  // which may reassociate float sums differently in each kernel.) The DP4A
 +  // program keeps the rows in a runtime loop, so a row runs the same
-+  // instructions whatever M is. The float program (PK) keeps 16 row
-+  // accumulators in registers: each row runs its own inlined copy of one
++  // instructions whatever M is. The float program (PK) keeps 9 row
++  // accumulators in registers (tiles of up to 9 rows): each row runs its own inlined copy of one
 +  // helper function (row_sums), in a branch that M decides. Bit identity
 +  // across those copies is verified on the Apple M5 only (op check, every row
 +  // of every M = 2..16); other GPUs, other Apple GPU families included, are
 +  // not verified. A mismatch could change output only at near ties. The
 +  // batched programs read each weight once per tile of up to
-+  // kBatchedMaxRowsPerTile rows.
++  // kBatchedMaxRowsPerTile rows (DP4A) or 9 rows (float).
 +  constexpr uint32_t kMinBatchedM = 2;
 +  constexpr uint32_t kMaxBatchedM = 16;
 +  const bool small_m = M >= kMinBatchedM && M <= kMaxBatchedM;
@@ -1841,12 +1874,14 @@ index 45baa67..46310f7 100644
 +    constexpr uint32_t col_groups = 4;
 +    constexpr uint32_t cols_per_thread = 4;
 +    constexpr uint32_t cols_per_wg = cols_per_thread * col_groups;
-+    constexpr uint32_t tile_rows = kBatchedMaxRowsPerTile;
++    // Tiles of up to 9 rows (matmul_nbits_batched.wgsl.template "Speed"):
++    // every accumulator costs registers in every thread, even at M = 1.
++    constexpr uint32_t tile_rows = 9;
 +    // Lane sums for the final reduction in workgroup memory, 4 rows at a
 +    // time: 4 KB (float16) or 8 KB (float32).
 +    constexpr uint32_t reduce_rows = 4;
-+    // Row tiles of equal size (one tile for M <= kBatchedMaxRowsPerTile). M
-+    // and the tile size are uniforms, so every M uses the same pipeline.
++    // Row tiles of equal size (one tile for M <= 9). M and the tile size are
++    // uniforms, so every M uses the same pipeline.
 +    const uint32_t num_M_tile = CeilDiv(M, tile_rows);
 +    const uint32_t rows_per_tile = CeilDiv(M, num_M_tile);
 +    const uint32_t num_N_tile = CeilDiv(N, cols_per_wg);
@@ -1891,7 +1926,7 @@ index 45baa67..46310f7 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +366,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +368,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -1909,7 +1944,7 @@ index 45baa67..46310f7 100644
                                                                   K,
                                                                   block_size,
                                                                   nbits,
-@@ -318,6 +444,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -318,6 +446,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                   {num_M_tile},
                                   {weight_index}});
      program.CacheHint(nbits, has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, subgroup_min_size);
@@ -1917,7 +1952,7 @@ index 45baa67..46310f7 100644
  
      return context.RunProgram(program);
    }
-@@ -363,6 +490,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -363,6 +492,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    if (has_weight_idx_indirect) {
      program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
    }
@@ -1980,10 +2015,10 @@ index bf56d4f..ef71563 100644
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
-index 0000000..0a8a16e
+index 0000000..de60fb0
 --- /dev/null
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,258 @@
 +// Copyright (c) Microsoft Corporation. All rights reserved.
 +// Licensed under the MIT License.
 +
@@ -2013,18 +2048,25 @@ index 0000000..0a8a16e
 +//       (8 bits);
 +//       output = 0; output += acc_l for l = 0 .. k_lanes - 1; output += bias.
 +//
-+// Speed: one workgroup computes up to 16 rows for cols_per_wg columns; each
-+// B word is read and dequantized once for all rows of the tile. The 16 row
-+// accumulators are separate variables (vec4, one component per column of the
-+// thread), so they stay in registers: an accumulator array indexed by a
-+// runtime row loop was kept in memory and cost almost a full weight pass per
-+// extra row on the M5. Row m's step sits inside row m - 1's branch, so a
-+// one-row step tests one condition per B word (16 flat branches made M = 1
-+// about 10 % slower than this).
++// Speed: one workgroup computes a tile of up to 9 rows for cols_per_wg
++// columns; each B word is read and dequantized once for all rows of the tile.
++// M = 10..16 runs two row tiles of equal size (one more weight pass). 9 is
++// the largest pass the app sends (an MTP draft of 8 plus 1), so every verify
++// pass is one tile. The row accumulators are separate variables (vec4, one
++// component per column of the thread), so they stay in registers: an
++// accumulator array indexed by a runtime row loop was kept in memory and
++// cost almost a full weight pass per extra row on the M5. Each accumulator is
++// live for the whole loop whatever M is, so their number sets the register
++// use of every thread: with 16 a one-row step moved about 3 GB/s on an Intel
++// gen-9 GPU (126 ms for the GLM-OCR decoder's weights, 16 GB/s plain read);
++// with 9 it took 38 ms there and was not slower on the M5
++// (evidence: the OCR spike bench, mnb-bench.html). Row m's step sits inside
++// row m - 1's branch, so a one-row step tests one condition per B word (flat
++// branches made M = 1 about 10 % slower than this).
 +//
 +// Requirements (checked on the host): A has 4 components (K % 4 == 0), K is a
 +// multiple of block_size, block_size a multiple of 32 / n_bits, n_bits 4 or 8,
-+// tile_rows 16, reduce_rows 4, cols_per_thread 4.
++// tile_rows 9, reduce_rows 4, cols_per_thread 4.
 +
 +#param n_bits
 +#param has_zero_points
@@ -2123,13 +2165,6 @@ index 0000000..0a8a16e
 +  var acc6 = acc_t(0);
 +  var acc7 = acc_t(0);
 +  var acc8 = acc_t(0);
-+  var acc9 = acc_t(0);
-+  var acc10 = acc_t(0);
-+  var acc11 = acc_t(0);
-+  var acc12 = acc_t(0);
-+  var acc13 = acc_t(0);
-+  var acc14 = acc_t(0);
-+  var acc15 = acc_t(0);
 +
 +  for (var w = lane; w < uniforms.words; w += k_lanes) {
 +    let block_idx = (w * elements_per_word) / uniforms.block_size;
@@ -2178,27 +2213,6 @@ index 0000000..0a8a16e
 +                    acc7 += row_sums(a_base + 7u * K_of_a, w, b_lo, b_hi);
 +                    if (rows > 8u) {
 +                      acc8 += row_sums(a_base + 8u * K_of_a, w, b_lo, b_hi);
-+                      if (rows > 9u) {
-+                        acc9 += row_sums(a_base + 9u * K_of_a, w, b_lo, b_hi);
-+                        if (rows > 10u) {
-+                          acc10 += row_sums(a_base + 10u * K_of_a, w, b_lo, b_hi);
-+                          if (rows > 11u) {
-+                            acc11 += row_sums(a_base + 11u * K_of_a, w, b_lo, b_hi);
-+                            if (rows > 12u) {
-+                              acc12 += row_sums(a_base + 12u * K_of_a, w, b_lo, b_hi);
-+                              if (rows > 13u) {
-+                                acc13 += row_sums(a_base + 13u * K_of_a, w, b_lo, b_hi);
-+                                if (rows > 14u) {
-+                                  acc14 += row_sums(a_base + 14u * K_of_a, w, b_lo, b_hi);
-+                                  if (rows > 15u) {
-+                                    acc15 += row_sums(a_base + 15u * K_of_a, w, b_lo, b_hi);
-+                                  }
-+                                }
-+                              }
-+                            }
-+                          }
-+                        }
-+                      }
 +                    }
 +                  }
 +                }
@@ -2227,27 +2241,6 @@ index 0000000..0a8a16e
 +                    acc7 += row_sums(a_base + 7u * K_of_a, w, bv);
 +                    if (rows > 8u) {
 +                      acc8 += row_sums(a_base + 8u * K_of_a, w, bv);
-+                      if (rows > 9u) {
-+                        acc9 += row_sums(a_base + 9u * K_of_a, w, bv);
-+                        if (rows > 10u) {
-+                          acc10 += row_sums(a_base + 10u * K_of_a, w, bv);
-+                          if (rows > 11u) {
-+                            acc11 += row_sums(a_base + 11u * K_of_a, w, bv);
-+                            if (rows > 12u) {
-+                              acc12 += row_sums(a_base + 12u * K_of_a, w, bv);
-+                              if (rows > 13u) {
-+                                acc13 += row_sums(a_base + 13u * K_of_a, w, bv);
-+                                if (rows > 14u) {
-+                                  acc14 += row_sums(a_base + 14u * K_of_a, w, bv);
-+                                  if (rows > 15u) {
-+                                    acc15 += row_sums(a_base + 15u * K_of_a, w, bv);
-+                                  }
-+                                }
-+                              }
-+                            }
-+                          }
-+                        }
-+                      }
 +                    }
 +                  }
 +                }
@@ -2280,20 +2273,8 @@ index 0000000..0a8a16e
 +  }
 +  if (rows > 8u) {
 +    store_row(0u, group, lane, acc8);
-+    if (rows > 9u) { store_row(1u, group, lane, acc9); }
-+    if (rows > 10u) { store_row(2u, group, lane, acc10); }
-+    if (rows > 11u) { store_row(3u, group, lane, acc11); }
 +    workgroupBarrier();
 +    reduce_phase(batch, row0, 8u, rows, n_base, local_idx);
-+    workgroupBarrier();
-+  }
-+  if (rows > 12u) {
-+    store_row(0u, group, lane, acc12);
-+    if (rows > 13u) { store_row(1u, group, lane, acc13); }
-+    if (rows > 14u) { store_row(2u, group, lane, acc14); }
-+    if (rows > 15u) { store_row(3u, group, lane, acc15); }
-+    workgroupBarrier();
-+    reduce_phase(batch, row0, 12u, rows, n_base, local_idx);
 +  }
 +}  // MAIN
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_mlp.cc

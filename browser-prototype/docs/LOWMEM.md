@@ -866,3 +866,42 @@ open hang report on an Intel UHD 630 (web-llm #489).
 Gates on the M5 with the pinned slices dist: `lowmem-batchinv.html?model=e4b`
 528/528, `lowmem-batchinv.html` (12B) 92/92, `npm test` 1196 pass.
 
+
+## tile9 and key step 8 (2026-09-30): pinned for the GLM-OCR engine
+
+Pinned dist: `ort-fork-dist-tile9k8` (fork branch `mnb-tile9` on `gpu-slices`).
+
+| Commit | Change |
+|---|---|
+| 0c8a61d | The float `MatMulNBitsBatched` kernel keeps tiles of up to 9 rows. Rows 10-16 take a second tile. Before: 16 register accumulators in one tile. |
+| 0176080 | Flash-attention prefill with 32-bit inputs steps 8 keys at a time. 16-bit inputs (Gemma) keep their step. |
+
+Why: on the Intel gen-9 HP the 16-accumulator kernel spilled registers. One GLM-OCR decode step took 227 ms. The image reader's attention (f32, 16 heads x 64, 2464 tokens) was most of the 41 s image time.
+
+Matmul bench (GLM-OCR decoder weights, 363.7 MB, f32, ms per pass by row count):
+
+| GPU | Tile | 1 row | 3 | 5 | 7 | 9 |
+|---|---|---|---|---|---|---|
+| Intel gen-9 | 16 (before) | 125.8 | 132.5 | 158.0 | 171.0 | 193.3 |
+| Intel gen-9 | 9 (pinned) | 38.0 | 49.4 | 63.8 | 76.1 | 90.6 |
+| Apple M5 | 16 (before) | 6.7 | 7.9 | 8.8 | 9.0 | 9.6 |
+| Apple M5 | 9 (pinned) | 4.3 | 4.1 | 5.3 | 6.4 | 7.5 |
+
+Attention bench (one image-reader layer, ms):
+
+| GPU | Key step 32 (before) | Key step 8 (pinned) | Largest difference |
+|---|---|---|---|
+| Intel gen-9 | 1061.9 | 483.6 | 1.0e-7 |
+| Apple M5 | 28.5 | 22.5 | 1.5e-7 |
+
+GLM-OCR engine, one page (`twocol.png`, 342 tokens, 3 drafts per pass):
+
+| GPU | Image reader | Prompt | Decode |
+|---|---|---|---|
+| Intel gen-9, tile9 only | 41.3 s | 5.5 s | 13.7 tok/s |
+| Intel gen-9, tile9k8 | 28.3 s | 5.0 s | 19.5 tok/s |
+| Apple M5, tile9k8 | 1.9 s | 0.6 s | 215.9 tok/s |
+
+Bits: the Gemma path is unchanged. Gates on the Apple M5 with this dist: `lowmem-batchinv.html?model=e4b` 528/528, 12B 92/92. The key-step change moves the online-softmax rescale points, so f32 attention may differ in the last bits. Output of the GLM-OCR engine with drafts equals plain decoding token for token on both machines.
+
+Sources: `~/BlinkFix-models/glm-ocr-engine/results/` (`mnb-*-tiles-f32.json`, `attnbench-*-k.json`, `engine-*8-tile9k8-summary.json`), gate files in `~/BlinkFix-models/ort-fork-dist-tile9k8/`.
