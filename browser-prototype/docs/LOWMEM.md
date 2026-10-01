@@ -905,3 +905,33 @@ GLM-OCR engine, one page (`twocol.png`, 342 tokens, 3 drafts per pass):
 Bits: the Gemma path is unchanged. Gates on the Apple M5 with this dist: `lowmem-batchinv.html?model=e4b` 528/528, 12B 92/92. The key-step change moves the online-softmax rescale points, so f32 attention may differ in the last bits. Output of the GLM-OCR engine with drafts equals plain decoding token for token on both machines.
 
 Sources: `~/BlinkFix-models/glm-ocr-engine/results/` (`mnb-*-tiles-f32.json`, `attnbench-*-k.json`, `engine-*8-tile9k8-summary.json`), gate files in `~/BlinkFix-models/ort-fork-dist-tile9k8/`.
+
+## ovis-speed (2026-10-01): pinned for the OvisOCR2 engine
+
+Pinned dist: `ort-fork-dist-ovis` (fork branch `ovis-speed` on `mnb-tile9`, commit 5297cec).
+The wasm build-info string names cb6d3a7: the tree was built just before the final commit, whose content it equals (`BUILD-NOTE.txt` in the dist).
+
+| Change | What it does |
+|---|---|
+| LinearAttention `state_window` on WebGPU | The op keeps the recurrent state after each of the last W tokens (W <= 16). State tensors are (W, B, H, dk, dv). The op reads only slot W-1 of the past state. |
+| Chunked LinearAttention prefill | A pass of more than 16 tokens runs two programs (`LinearAttentionChunkPrep`, `LinearAttentionChunkScan`) instead of one token after another. With a state window, the last W tokens still take the token loop. Passes of 1-16 tokens keep the token loop. |
+| Tiled fp16 attention (opt-in) | A session with the config entry `webgpu.flash_attention_tiled=1` runs the 16-bit, head-64 MultiHeadAttention prefill as `FlashAttentionTiled`. Only the OvisOCR2 image reader sets it (lock `runtime.visionAttention: 'tiled'`). Every GPU runs the same program. |
+
+Default programs are unchanged. Gates on the Apple M5 (JSPI): `lowmem-batchinv.html?model=e4b` 528/528, 12B 92/92 (`~/BlinkFix-models/ort-fork-dist-ovis/gates/`).
+
+| Check | Result |
+|---|---|
+| One LinearAttention node, 1-16 tokens with a state window | bit-identical rows (`la-test.html`) |
+| Chunked prefill vs float64 reference | largest difference 3e-8 |
+| 20-token greedy text, chunked prefill + tiled image reader | same as the tile9k8 dist (`hp-prefill-ovis-tiled.json`) |
+
+Intel gen-9 HP, OvisOCR2 1 MP page:
+
+| Part | tile9k8 | ovis-speed |
+|---|---|---|
+| Image reader, fp16 | 20.3 s (attention 12.9 s) | 14.6 s with the tiled opt-in (attention 7.7 s) |
+| Prompt step, 1099 tokens, q4 | 11.5 s (LinearAttention 3.0 s) | 9.9 s (LinearAttention 0.93 s) |
+| Decode step q4 | 104-117 ms | same |
+
+Sources: `~/BlinkFix-models/ocr-probes/results/` (`hp-qv-pinned-prof.json`, `hp-qv-tiled-v2.json`, `hp-prefill-pinned.json`, `hp-prefill-ovis1.json`, `hp-la-test.json`), `~/BlinkFix-models/ocr-probes/README.md` section 11.
+Known latent bug (default FlashAttention, not new): a nonzero scalar f16 attention bias is read wrong. No model in the app hits it. The tiled program reads it right.

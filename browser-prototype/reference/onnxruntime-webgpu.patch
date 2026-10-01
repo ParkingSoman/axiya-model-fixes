@@ -11,6 +11,22 @@ index 0c419ff..7f7a899 100644
  
  namespace sparse_attention {
  // Environment variable to enable or disable sparse attention v1 kernel. Default is 0 (enabled).
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/attention_common.h b/onnxruntime/contrib_ops/webgpu/bert/attention_common.h
+index 5955b58..59daea2 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/attention_common.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/attention_common.h
+@@ -109,6 +109,11 @@ struct WebgpuAttentionParameters {
+   bool rotary_interleaved_ = false;
+   bool use_smooth_softmax_ = false;
+   float softcap_ = 0.0;
++  // ORT fork (ovis): session config "webgpu.flash_attention_tiled" = "1" (MultiHeadAttention)
++  // picks FlashAttentionTiledProgram for the dense prefill when it applies (16-bit, head size 64,
++  // no causal mask/sink/window/quantized cache). Same programs on every GPU: the model's
++  // session opts in, never the adapter.
++  bool flash_attention_tiled_ = false;
+   int zeros_count_ = 0;
+   ;
+   int* zero_ptr_ = nullptr;
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc b/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
 index a47b313..d0e0f33 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc
@@ -215,7 +231,7 @@ index 1f95a2f..3deb391 100644
          let ip = vp - state_length;
          state_val = input[input_base + ip * input_pos_stride];
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
-index a800232..21b63a0 100644
+index a800232..6bbe0c1 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc
 @@ -16,6 +16,12 @@ using namespace ::onnxruntime::common;
@@ -264,7 +280,180 @@ index a800232..21b63a0 100644
  static_assert(DensePrefillFitsWorkgroupStorage(true, true, 128, 0, false, 64, 16384));
  static_assert(DensePrefillFitsWorkgroupStorage(false, true, 128, 0, false, 64, 16384));
  static_assert(!DensePrefillFitsWorkgroupStorage(true, true, 128, 8, true, 64, 16384));
-@@ -309,6 +329,27 @@ Status PrepareIndirectDispatchProgram::GenerateShaderCode(ShaderHelper& shader)
+@@ -191,6 +211,172 @@ FlashAttentionProgram::FlashAttentionProgram(const std::string& kernel_name,
+       use_seqlens_q_(use_seqlens_q) {
+ }
+ 
++Status FlashAttentionTiledProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("q", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);
++  shader.AddInput("present_key", ShaderUsage::UseUniform);
++  shader.AddInput("present_value", ShaderUsage::UseUniform);
++  if (has_attention_bias_) {
++    shader.AddInput("attention_bias", ShaderUsage::UseUniform);
++  }
++  shader.AddOutput("output", ShaderUsage::UseUniform);
++  shader.AdditionalImplementation()
++      << "const NH: u32 = " << num_heads_ << "u;\n"
++         "const HV: u32 = 16u;\n"   // head size 64 = 16 vec4
++         "const BQ: u32 = 32u;\n"
++         "const KS: u32 = 32u;\n"
++         "const PS: u32 = 33u;\n"   // padded score row
++         "const NEG: f32 = -3.4028234663852886e+38f;\n"
++         "var<workgroup> qs: array<q_value_t, BQ * HV>;\n"
++         "var<workgroup> kv: array<q_value_t, KS * HV>;\n"
++         "var<workgroup> ps: array<f32, BQ * PS>;\n"
++         "var<workgroup> mrow: array<f32, BQ>;\n"
++         "var<workgroup> lrow: array<f32, BQ>;\n"
++         "var<workgroup> arow: array<f32, BQ>;\n";
++  shader.MainFunctionBody() << R"WGSL(
++  let wg_idx = workgroup_idx + uniforms.workgroup_offset;
++  let batch_head_idx = wg_idx / uniforms.num_seq_tile;
++  let head_idx = batch_head_idx % NH;
++  let batch_idx = batch_head_idx / NH;
++  let q0 = (wg_idx % uniforms.num_seq_tile) * BQ;
++  let S = uniforms.new_sequence_length;
++  let T = uniforms.total_sequence_length;
++  let tid = local_idx;
++  // Query tile (zeros past the last query).
++  for (var e = tid; e < BQ * HV; e += 64u) {
++    let r = e / HV;
++    let qi = q0 + r;
++)WGSL";
++  if (q_BNSH_) {
++    shader.MainFunctionBody() << "    let qoff = (batch_head_idx * S + qi) * HV + e % HV;\n";
++  } else {
++    shader.MainFunctionBody() << "    let qoff = ((batch_idx * S + qi) * NH + head_idx) * HV + e % HV;\n";
++  }
++  shader.MainFunctionBody() << R"WGSL(    qs[e] = select(q_value_t(0), q[qoff], qi < S);
++  }
++  if (tid < BQ) {
++    mrow[tid] = NEG;
++    lrow[tid] = 0.0;
++  }
++  let kv_base = batch_head_idx / uniforms.n_reps * uniforms.present_sequence_length * HV;
++  // Phase A block: queries qb*4.., keys kb*4..; phase C block: queries qc*4.., vec4 columns dc*2, dc*2+1.
++  let qb = tid / 8u;
++  let kb = tid % 8u;
++  let qc = tid / 8u;
++  let dc = tid % 8u;
++  var o00 = vec4<f32>(0.0); var o01 = vec4<f32>(0.0);
++  var o10 = vec4<f32>(0.0); var o11 = vec4<f32>(0.0);
++  var o20 = vec4<f32>(0.0); var o21 = vec4<f32>(0.0);
++  var o30 = vec4<f32>(0.0); var o31 = vec4<f32>(0.0);
++  for (var k0 = 0u; k0 < T; k0 += KS) {
++    workgroupBarrier();
++    for (var e = tid; e < KS * HV; e += 64u) {
++      let kr = k0 + e / HV;
++      kv[e] = select(q_value_t(0), present_key[kv_base + k0 * HV + e], kr < T);
++    }
++    workgroupBarrier();
++    // s<a>.<c>: query a, key c of this thread's 4 x 4 block.
++    var s0 = vec4<f32>(0.0);
++    var s1 = vec4<f32>(0.0);
++    var s2 = vec4<f32>(0.0);
++    var s3 = vec4<f32>(0.0);
++    for (var i0 = 0u; i0 < HV; i0++) {
++      let i = (i0 + kb) % HV;   // staggered so the 8 key blocks read different banks
++      let qa = vec4<f32>(qs[(qb * 4u) * HV + i]);
++      let qb1 = vec4<f32>(qs[(qb * 4u + 1u) * HV + i]);
++      let qb2 = vec4<f32>(qs[(qb * 4u + 2u) * HV + i]);
++      let qb3 = vec4<f32>(qs[(qb * 4u + 3u) * HV + i]);
++      let ka = vec4<f32>(kv[(kb * 4u) * HV + i]);
++      let kb1 = vec4<f32>(kv[(kb * 4u + 1u) * HV + i]);
++      let kb2 = vec4<f32>(kv[(kb * 4u + 2u) * HV + i]);
++      let kb3 = vec4<f32>(kv[(kb * 4u + 3u) * HV + i]);
++      s0 += vec4<f32>(dot(qa, ka), dot(qa, kb1), dot(qa, kb2), dot(qa, kb3));
++      s1 += vec4<f32>(dot(qb1, ka), dot(qb1, kb1), dot(qb1, kb2), dot(qb1, kb3));
++      s2 += vec4<f32>(dot(qb2, ka), dot(qb2, kb1), dot(qb2, kb2), dot(qb2, kb3));
++      s3 += vec4<f32>(dot(qb3, ka), dot(qb3, kb1), dot(qb3, kb2), dot(qb3, kb3));
++    }
++    for (var a = 0u; a < 4u; a++) {
++      var sa = s0;
++      if (a == 1u) { sa = s1; }
++      if (a == 2u) { sa = s2; }
++      if (a == 3u) { sa = s3; }
++      for (var c = 0u; c < 4u; c++) {
++        let qr = qb * 4u + a;
++        let kk = k0 + kb * 4u + c;
++        var s = sa[c] * uniforms.alpha;
++)WGSL";
++  if (has_attention_bias_) {
++    shader.MainFunctionBody() << R"WGSL(        if (kk < T && q0 + qr < S) {
++          let bb = select(batch_idx, 0u, batch_idx >= uniforms.attn_bias_dim0);
++          let bh = select(head_idx, 0u, head_idx >= uniforms.attn_bias_dim1);
++          let bidx = ((bb * uniforms.attn_bias_dim1 + bh) * S + q0 + qr) * uniforms.attn_bias_dim3 + kk;
++)WGSL";
++    shader.MainFunctionBody() << (bias_fp16_ ? "          s += unpack2x16float(attention_bias[bidx >> 1u])[bidx & 1u];\n"
++                                             : "          s += f32(attention_bias[bidx]);\n");
++    shader.MainFunctionBody() << R"WGSL(        }
++)WGSL";
++  }
++  shader.MainFunctionBody() << R"WGSL(        ps[qr * PS + kb * 4u + c] = select(NEG, s, kk < T);
++      }
++    }
++    workgroupBarrier();
++    // V tile; online softmax per query row (threads 0..31).
++    for (var e = tid; e < KS * HV; e += 64u) {
++      let kr = k0 + e / HV;
++      kv[e] = select(q_value_t(0), present_value[kv_base + k0 * HV + e], kr < T);
++    }
++    if (tid < BQ) {
++      let m_old = mrow[tid];
++      var mx = m_old;
++      for (var c = 0u; c < KS; c++) { mx = max(mx, ps[tid * PS + c]); }
++      var sum = 0.0;
++      for (var c = 0u; c < KS; c++) {
++        let p = exp(ps[tid * PS + c] - mx);
++        ps[tid * PS + c] = p;
++        sum += p;
++      }
++      let a = exp(m_old - mx);
++      arow[tid] = a;
++      lrow[tid] = lrow[tid] * a + sum;
++      mrow[tid] = mx;
++    }
++    workgroupBarrier();
++    let a0 = arow[qc * 4u];
++    let a1 = arow[qc * 4u + 1u];
++    let a2 = arow[qc * 4u + 2u];
++    let a3 = arow[qc * 4u + 3u];
++    o00 *= a0; o01 *= a0; o10 *= a1; o11 *= a1; o20 *= a2; o21 *= a2; o30 *= a3; o31 *= a3;
++    for (var c = 0u; c < KS; c++) {
++      let v0 = vec4<f32>(kv[c * HV + dc * 2u]);
++      let v1 = vec4<f32>(kv[c * HV + dc * 2u + 1u]);
++      let p0 = ps[(qc * 4u) * PS + c];
++      let p1 = ps[(qc * 4u + 1u) * PS + c];
++      let p2 = ps[(qc * 4u + 2u) * PS + c];
++      let p3 = ps[(qc * 4u + 3u) * PS + c];
++      o00 += p0 * v0; o01 += p0 * v1;
++      o10 += p1 * v0; o11 += p1 * v1;
++      o20 += p2 * v0; o21 += p2 * v1;
++      o30 += p3 * v0; o31 += p3 * v1;
++    }
++  }
++  workgroupBarrier();
++  for (var a = 0u; a < 4u; a++) {
++    let qi = q0 + qc * 4u + a;
++    if (qi < S) {
++      let l = lrow[qc * 4u + a];
++      let inv = select(0.0, 1.0 / l, l > 0.0);
++      var r0 = o00; var r1 = o01;
++      if (a == 1u) { r0 = o10; r1 = o11; }
++      if (a == 2u) { r0 = o20; r1 = o21; }
++      if (a == 3u) { r0 = o30; r1 = o31; }
++      let off = ((batch_idx * S + qi) * NH + head_idx) * HV + dc * 2u;
++      output[off] = q_value_t(r0 * inv);
++      output[off + 1u] = q_value_t(r1 * inv);
++    }
++  }
++)WGSL";
++  return Status::OK();
++}
++
+ Status SplitPackedQKVWithRotaryEmbeddingAndCopyKVProgram::GenerateShaderCode(ShaderHelper& sh) const {
+   const auto& packed_qkv = sh.AddInput("packed_qkv", ShaderUsage::UseUniform);
+   const auto& seqlens = sh.AddInput("seqlens", ShaderUsage::UseUniform);
+@@ -309,6 +495,27 @@ Status PrepareIndirectDispatchProgram::GenerateShaderCode(ShaderHelper& shader)
    return Status::OK();
  }
  
@@ -292,7 +481,7 @@ index a800232..21b63a0 100644
  Status CopyKVCache(onnxruntime::webgpu::ComputeContext& context, const WebgpuAttentionParameters& parameters,
                     const Tensor* K, const Tensor* past_key, Tensor* present_key,
                     const Tensor* V, const Tensor* past_value, Tensor* present_value,
-@@ -919,6 +960,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
+@@ -919,6 +1126,133 @@ Status ComputeFlashAttentionPagedDecodeVxReduce(onnxruntime::webgpu::ComputeCont
    return context.RunProgram(program);
  }
  
@@ -426,7 +615,66 @@ index a800232..21b63a0 100644
  Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, const Tensor* attention_bias,
                             Tensor* output, const Tensor* past_key, Tensor* present_key, const Tensor* past_value, Tensor* present_value,
                             const WebgpuAttentionParameters& parameters, onnxruntime::webgpu::ComputeContext& context, const Tensor* seqlen_k,
-@@ -1288,84 +1456,107 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+@@ -1283,89 +1617,166 @@ Status ApplyFlashAttention(const Tensor* Q, const Tensor* K, const Tensor* V, co
+                                "support the requested feature, or gate the feature off at the "
+                                "PagedAttention layer before dispatching FA.");
+       }
++      // ORT fork (ovis): opt-in tiled prefill (see FlashAttentionTiledProgram).
++      if (parameters.flash_attention_tiled_ && is_fp16_q && parameters.head_size_ == 64 &&
++          parameters.v_head_size_ == 64 && !parameters.is_unidirectional_ && head_sink == nullptr &&
++          !has_local_window && !kv_cache_quantization_enabled && !use_seqlen_k && !use_seqlens_q &&
++          !use_q4_turbo_quant) {
++        const bool tiled_q_BNSH = parameters.qkv_format_ == Q_K_V_BNSH;
++        const uint32_t tiled_num_seq_tile = (parameters.sequence_length_ + 31u) / 32u;
++        const uint32_t tiled_total_workgroups = parameters.batch_size_ * parameters.num_heads_ * tiled_num_seq_tile;
++        const uint64_t tiled_work_per_workgroup = std::max<uint64_t>(
++            1, uint64_t{32} * static_cast<uint64_t>(parameters.total_sequence_length_) * 64u);
++        const uint32_t tiled_slice = static_cast<uint32_t>(std::clamp<uint64_t>(
++            FlashAttentionSliceWork() / tiled_work_per_workgroup, 1, std::max<uint32_t>(tiled_total_workgroups, 1)));
++        const float tiled_alpha = parameters.scale_ == 0.0f ? 1.f / sqrt(static_cast<float>(parameters.head_size_))
++                                                            : parameters.scale_;
++        uint32_t bias_dim0 = 1, bias_dim1 = 1, bias_dim3 = 0;
++        if (attention_bias != nullptr) {
++          const auto& bias_shape = attention_bias->Shape();
++          bias_dim0 = static_cast<uint32_t>(bias_shape[0]);
++          bias_dim1 = static_cast<uint32_t>(bias_shape[1]);
++          bias_dim3 = static_cast<uint32_t>(bias_shape[3]);
++        }
++        for (uint32_t offset = 0; offset < tiled_total_workgroups; offset += tiled_slice) {
++          const uint32_t count = std::min(tiled_slice, tiled_total_workgroups - offset);
++          const bool bias_fp16 = attention_bias != nullptr &&
++                                 attention_bias->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16;
++          FlashAttentionTiledProgram program{attention_bias != nullptr, bias_fp16, tiled_q_BNSH, parameters.num_heads_};
++          program.AddInputs({{Q, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                             {present_key, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                             {present_value, ProgramTensorMetadataDependency::TypeAndRank, 4}});
++          if (attention_bias != nullptr) {
++            program.AddInput({attention_bias, ProgramTensorMetadataDependency::TypeAndRank});
++          }
++          program.AddOutput({attn_output, ProgramTensorMetadataDependency::TypeAndRank, 4});
++          program.SetDispatchGroupSize(count)
++              .SetWorkgroupSize(64)
++              .CacheHint(attention_bias != nullptr, bias_fp16, tiled_q_BNSH, parameters.num_heads_)
++              .AddUniformVariables({{static_cast<uint32_t>(parameters.sequence_length_)},
++                                    {static_cast<uint32_t>(parameters.total_sequence_length_)},
++                                    {static_cast<uint32_t>(present_sequence_length)},
++                                    {static_cast<uint32_t>(parameters.n_reps)},
++                                    {tiled_alpha},
++                                    {tiled_num_seq_tile},
++                                    {bias_dim0},
++                                    {bias_dim1},
++                                    {bias_dim3},
++                                    {offset}})
++              .SetOwnSubmit(tiled_slice < tiled_total_workgroups);
++          ORT_RETURN_IF_ERROR(context.RunProgram(program));
++        }
++        if (use_q4_turbo_quant) {
++          ORT_RETURN_IF_ERROR(ApplyHadamardTransform(context, attn_output, output, parameters.head_size_));
++        }
++        return Status::OK();
++      }
+       // Prefill path: FlashAttentionProgram (single kernel with subgroup shuffles)
+       bool has_attention_bias = attention_bias != nullptr;
        bool is_fp16 = is_fp16_q;
        bool q_BNSH = parameters.qkv_format_ == Q_K_V_BNSH;
        bool has_head_sink = head_sink != nullptr;
@@ -608,7 +856,7 @@ index a800232..21b63a0 100644
      // Split-reduce path (fused QKV + VxReduce). Handles quantized and unquantized caches.
      const uint32_t num_total_seq_length_tile = (parameters.total_sequence_length_ + tile_size - 1) / tile_size;
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
-index 3e4c16c..d8ec535 100644
+index 3e4c16c..71a8080 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
 +++ b/onnxruntime/contrib_ops/webgpu/bert/flash_attention.h
 @@ -119,7 +119,8 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
@@ -621,7 +869,43 @@ index 3e4c16c..d8ec535 100644
  
   private:
    bool has_attention_bias_;
-@@ -272,6 +273,53 @@ class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionD
+@@ -143,6 +144,35 @@ class FlashAttentionProgram final : public Program<FlashAttentionProgram> {
+   bool use_seqlens_q_;
+ };
+ 
++// ORT fork (ovis): tiled dense prefill for 16-bit inputs with head size 64, no mask, no
++// past, opt-in per session ("webgpu.flash_attention_tiled" = "1"). A workgroup of 64 threads
++// owns 32 queries; for each step of 32 keys it computes the 32 x 32 scores as 4 x 4 register
++// blocks (Q and K tiles in workgroup memory), runs the online softmax per query row, then adds
++// P V as 4-query x 8-dim register blocks. Scores, softmax and output sums are f32; the output
++// is normalized once at the end.
++class FlashAttentionTiledProgram final : public Program<FlashAttentionTiledProgram> {
++ public:
++  FlashAttentionTiledProgram(bool has_attention_bias, bool bias_fp16, bool q_BNSH, int num_heads)
++      : Program{"FlashAttentionTiled"}, has_attention_bias_(has_attention_bias), bias_fp16_(bias_fp16), q_BNSH_(q_BNSH), num_heads_(num_heads) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES({"new_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"total_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"present_sequence_length", ProgramUniformVariableDataType::Uint32},
++                                          {"n_reps", ProgramUniformVariableDataType::Uint32},
++                                          {"alpha", ProgramUniformVariableDataType::Float32},
++                                          {"num_seq_tile", ProgramUniformVariableDataType::Uint32},
++                                          {"attn_bias_dim0", ProgramUniformVariableDataType::Uint32},
++                                          {"attn_bias_dim1", ProgramUniformVariableDataType::Uint32},
++                                          {"attn_bias_dim3", ProgramUniformVariableDataType::Uint32},
++                                          {"workgroup_offset", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool has_attention_bias_;
++  bool bias_fp16_;  // a float16 bias is declared array<u32> (gpu-f16-read): unpack the half
++  bool q_BNSH_;
++  int num_heads_;
++};
++
+ // Dedicated single-kernel prefill program for PagedAttention. It mirrors the
+ // dense FlashAttentionProgram workgroup algorithm but reads K/V tiles through
+ // block_table instead of materializing dense K/V scratch tensors.
+@@ -272,6 +302,53 @@ class FlashAttentionDecodeVxReduceProgram final : public Program<FlashAttentionD
    bool use_seqlen_k_;
  };
  
@@ -1108,6 +1392,636 @@ index 00807f3..57b5b63 100644
        if (has_qk_norm && !decode_norm_fast_path) {
          qNorm = context.CreateGPUTensor(query->DataType(), query->Shape());
          kNorm = context.CreateGPUTensor(key->DataType(), key->Shape());
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
+index 570effd..b74c12b 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ 
+ #include "contrib_ops/webgpu/bert/linear_attention.h"
++#include "contrib_ops/cpu/bert/linear_attention_helper.h"
+ 
+ #include "core/providers/webgpu/shader_helper.h"
+ #include "core/providers/webgpu/webgpu_supported_types.h"
+@@ -83,6 +84,7 @@ Status LinearAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
+   return WGSL_TEMPLATE_APPLY(shader, "bert/linear_attention.wgsl.template",
+                              WGSL_TEMPLATE_PARAMETER(decay_broadcast_dk, decay_broadcast_dk_),
+                              WGSL_TEMPLATE_PARAMETER(has_initial_state, has_initial_state_),
++                             WGSL_TEMPLATE_PARAMETER(has_state_window, has_state_window_),
+                              WGSL_TEMPLATE_PARAMETER(initial_state_in_present_state, initial_state_in_present_state_),
+                              WGSL_TEMPLATE_PARAMETER(subgroup_min_size, subgroup_min_size_),
+                              WGSL_TEMPLATE_PARAMETER(tile_v, tile_v_),
+@@ -110,8 +112,261 @@ LinearAttention::LinearAttention(const OpKernelInfo& info)
+   scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
+   q_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("q_num_heads"));
+   kv_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("kv_num_heads"));
+-  ORT_ENFORCE(info.GetAttrOrDefault<int64_t>("state_window", 0) == 0,
+-              "WebGPU LinearAttention does not support state_window > 0 (CUDA EP only)");
++  // ORT fork (ovis): state_window W > 0 keeps the state after each of the last W tokens.
++  ORT_THROW_IF_ERROR(linear_attention_helper::ParseStateWindow(info, state_window_));
++}
++
++// =============================================================================
++// ORT fork (ovis): chunked gated-delta-rule prefill (see linear_attention.h)
++// =============================================================================
++// Chunk length C and the record layout shared by the two passes. One chunk record (index
++// bh * num_chunks + chunk) holds W (C x 128), U (C x 128), P (C x C) and the decay factors
++// G (kChunkG floats: C query factors scale*exp(gc_t), C key factors exp(gc_last - gc_s), then
++// exp(gc_last)). Every exponent is <= 0 (decay is log-space and <= 0; gc is its running sum).
++constexpr uint32_t kChunk = 16;
++constexpr uint32_t kChunkHead = 128;  // d_k = d_v the chunked path supports
++constexpr uint32_t kChunkG = 2 * kChunk + 4;
++constexpr uint32_t kChunkPG = kChunk * kChunk + kChunkG;  // P and G share one buffer (8 storage buffers max)
++constexpr uint32_t kChunkTileV = 16;  // value columns per scan workgroup (4 x vec4)
++
++Status LinearAttentionChunkPrepProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("query", ShaderUsage::UseUniform);
++  shader.AddInput("key", ShaderUsage::UseUniform);
++  shader.AddInput("value", ShaderUsage::UseUniform);
++  shader.AddInput("decay", ShaderUsage::UseUniform);
++  shader.AddInput("beta", ShaderUsage::UseUniform);
++  shader.AddOutput("wbuf", ShaderUsage::UseUniform);
++  shader.AddOutput("ubuf", ShaderUsage::UseUniform);
++  shader.AddOutput("pgbuf", ShaderUsage::UseUniform);
++  shader.AdditionalImplementation()
++      << "const C: u32 = " << kChunk << "u;\n"
++      << "const D: u32 = " << kChunkHead << "u;\n"
++      << "const PG: u32 = " << kChunkPG << "u;\n"
++      << "var<workgroup> ks: array<f32, " << kChunk * kChunkHead << ">;\n"
++         "var<workgroup> gc: array<f32, C>;\n"
++         "var<workgroup> bs: array<f32, C>;\n"
++         "var<workgroup> am: array<f32, C * C>;\n"
++         "var<workgroup> tm: array<f32, C * C>;\n";
++  shader.MainFunctionBody() << R"WGSL(
++  let rec = workgroup_idx;
++  let bh = rec / uniforms.num_chunks;
++  let chunk = rec % uniforms.num_chunks;
++  let H = uniforms.num_heads;
++  let b = bh / H;
++  let h = bh % H;
++  let t0 = chunk * C;
++  let n = min(C, uniforms.prefix_length - t0);
++  let i = local_idx;
++  // Keys of the chunk (rows >= n are zero), running decay sum and betas.
++  for (var s = 0u; s < C; s++) {
++    var kv = 0.0;
++    if (s < n) {
++      kv = f32(key[((b * uniforms.seq_length + t0 + s) * H + h) * D + i]);
++    }
++    ks[s * D + i] = kv;
++  }
++  if (i == 0u) {
++    var acc = 0.0;
++    for (var s = 0u; s < C; s++) {
++      var gv = 0.0;
++      var bv = 0.0;
++      if (s < n) {
++        let idx = (b * uniforms.seq_length + t0 + s) * H + h;
++        gv = f32(decay[idx]);
++        bv = f32(beta[idx]);
++      }
++      acc += gv;
++      gc[s] = acc;
++      bs[s] = bv;
++    }
++  }
++  workgroupBarrier();
++  // A[t][s] (s < t) and P[t][s] (s <= t); the dot loops start at different offsets per job so
++  // that neighbouring jobs read different workgroup-memory banks.
++  for (var job = i; job < C * C; job += workgroup_size_x) {
++    let t = job / C;
++    let s = job % C;
++    var a = 0.0;
++    if (s < t) {
++      var d = 0.0;
++      for (var x = 0u; x < D; x++) {
++        let xx = (x + job) % D;
++        d += ks[t * D + xx] * ks[s * D + xx];
++      }
++      a = bs[t] * exp(gc[t] - gc[s]) * d;
++    }
++    am[job] = a;
++    var p = 0.0;
++    if (s <= t && t < n) {
++      let qb = ((b * uniforms.seq_length + t0 + t) * H + h) * D;
++      var d = 0.0;
++      for (var x = 0u; x < D; x++) {
++        let xx = (x + job) % D;
++        d += f32(query[qb + xx]) * ks[s * D + xx];
++      }
++      p = uniforms.scale * exp(gc[t] - gc[s]) * d;
++    }
++    pgbuf[rec * PG + job] = p;
++    tm[job] = select(0.0, 1.0, t == s);
++  }
++  workgroupBarrier();
++  // T = (I + A)^-1 (unit lower triangular), one row after another.
++  for (var t = 1u; t < C; t++) {
++    if (i < t) {
++      var acc = 0.0;
++      for (var m = i; m < t; m++) {
++        acc -= am[t * C + m] * tm[m * C + i];
++      }
++      tm[t * C + i] = acc;
++    }
++    workgroupBarrier();
++  }
++  // Column i of W = T diag(beta exp(gc)) K and U = T diag(beta) V.
++  var w: array<f32, C>;
++  var u: array<f32, C>;
++  for (var c = 0u; c < C; c++) {
++    w[c] = 0.0;
++    u[c] = 0.0;
++  }
++  for (var s = 0u; s < C; s++) {
++    var vv = 0.0;
++    if (s < n) {
++      vv = f32(value[((b * uniforms.seq_length + t0 + s) * H + h) * D + i]);
++    }
++    let kval = ks[s * D + i] * bs[s] * exp(gc[s]);
++    let vval = vv * bs[s];
++    for (var c = 0u; c < C; c++) {
++      let tcs = tm[c * C + s];
++      w[c] += tcs * kval;
++      u[c] += tcs * vval;
++    }
++  }
++  for (var c = 0u; c < C; c++) {
++    wbuf[(rec * C + c) * D + i] = w[c];
++    ubuf[(rec * C + c) * D + i] = u[c];
++  }
++  if (i < C) {
++    let gl = gc[n - 1u];
++    pgbuf[rec * PG + C * C + i] = uniforms.scale * exp(gc[i]);
++    pgbuf[rec * PG + C * C + C + i] = select(0.0, exp(gl - gc[i]), i < n);
++    if (i == 0u) {
++      pgbuf[rec * PG + C * C + 2u * C] = exp(gl);
++    }
++  }
++)WGSL";
++  return Status::OK();
++}
++
++Status LinearAttentionChunkScanProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("query", ShaderUsage::UseUniform);  // vec4
++  shader.AddInput("key", ShaderUsage::UseUniform);    // scalar
++  if (has_initial_state_ && !initial_state_in_present_state_) {
++    shader.AddInput("initial_state", ShaderUsage::UseUniform);  // vec4
++  }
++  shader.AddInput("wbuf", ShaderUsage::UseUniform);  // vec4
++  shader.AddInput("ubuf", ShaderUsage::UseUniform);  // vec4
++  shader.AddInput("pgbuf", ShaderUsage::UseUniform);
++  shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);    // vec4
++  shader.AddOutput("present_state", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);  // vec4
++  shader.AdditionalImplementation()
++      << "const C: u32 = " << kChunk << "u;\n"
++      << "const D: u32 = " << kChunkHead << "u;\n"
++      << "const D4: u32 = " << kChunkHead / 4 << "u;\n"
++      << "const PG: u32 = " << kChunkPG << "u;\n"
++      << "const GB: u32 = " << kChunk * kChunk << "u;\n"
++      << "const TV4: u32 = " << kChunkTileV / 4 << "u;\n"
++         "var<workgroup> ss: array<vec4<f32>, D * TV4>;\n"
++         "var<workgroup> ds: array<vec4<f32>, C * TV4>;\n"
++         "var<workgroup> ys: array<vec4<f32>, C * TV4>;\n";
++  shader.MainFunctionBody() << R"WGSL(
++  let H = uniforms.num_heads;
++  let bh = workgroup_idx / uniforms.num_dv_tiles;
++  let tile = workgroup_idx % uniforms.num_dv_tiles;
++  let b = bh / H;
++  let h = bh % H;
++  let i = local_idx;
++  let col0 = tile * TV4;  // first vec4 column of this tile
++  // State tile S[k][col0 .. col0 + TV4) into workgroup memory (thread i = row k).
++  let state_row = (bh * D + i) * D4 + col0;
++  for (var j = 0u; j < TV4; j++) {
++)WGSL";
++  if (has_initial_state_) {
++    shader.MainFunctionBody() << (initial_state_in_present_state_
++                                      ? "    ss[i * TV4 + j] = vec4<f32>(present_state[uniforms.past_slot_offset + state_row + j]);\n"
++                                      : "    ss[i * TV4 + j] = vec4<f32>(initial_state[uniforms.past_slot_offset + state_row + j]);\n");
++  } else {
++    shader.MainFunctionBody() << "    ss[i * TV4 + j] = vec4<f32>(0.0);\n";
++  }
++  shader.MainFunctionBody() << R"WGSL(  }
++  for (var chunk = 0u; chunk < uniforms.num_chunks; chunk++) {
++    workgroupBarrier();
++    let rec = bh * uniforms.num_chunks + chunk;
++    let t0 = chunk * C;
++    let n = min(C, uniforms.prefix_length - t0);
++    {
++      // Threads 0..63: delta = U - W S; threads 64..127: y = scale exp(gc) Q S. One (row, vec4 column) each.
++      let which = i / (C * TV4);
++      let r = (i / TV4) % C;
++      let j = i % TV4;
++      if (r < n) {
++        var acc = vec4<f32>(0.0);
++        if (which == 0u) {
++          let wb = (rec * C + r) * D4;
++          for (var k4 = 0u; k4 < D4; k4++) {
++            let w = wbuf[wb + k4];
++            let kk = k4 * 4u;
++            acc += w.x * ss[kk * TV4 + j] + w.y * ss[(kk + 1u) * TV4 + j] + w.z * ss[(kk + 2u) * TV4 + j] + w.w * ss[(kk + 3u) * TV4 + j];
++          }
++          ds[r * TV4 + j] = ubuf[(rec * C + r) * D4 + col0 + j] - acc;
++        } else {
++          let qb = ((b * uniforms.seq_length + t0 + r) * H + h) * D4;
++          for (var k4 = 0u; k4 < D4; k4++) {
++            let q = vec4<f32>(query[qb + k4]);
++            let kk = k4 * 4u;
++            acc += q.x * ss[kk * TV4 + j] + q.y * ss[(kk + 1u) * TV4 + j] + q.z * ss[(kk + 2u) * TV4 + j] + q.w * ss[(kk + 3u) * TV4 + j];
++          }
++          ys[r * TV4 + j] = acc * pgbuf[rec * PG + GB + r];
++        }
++      } else if (which == 0u) {
++        ds[r * TV4 + j] = vec4<f32>(0.0);
++      }
++    }
++    workgroupBarrier();
++    if (i < C * TV4) {
++      let r = i / TV4;
++      let j = i % TV4;
++      if (r < n) {
++        var o = ys[r * TV4 + j];
++        for (var s = 0u; s <= r; s++) {
++          o += pgbuf[rec * PG + r * C + s] * ds[s * TV4 + j];
++        }
++        output[((b * uniforms.seq_length + t0 + r) * H + h) * D4 + col0 + j] = output_value_t(o);
++      }
++    }
++    // S = exp(gc_last) S + (exp(gc_last - gc) K)^T delta, row i.
++    let dl = pgbuf[rec * PG + GB + 2u * C];
++    var s0 = ss[i * TV4] * dl;
++    var s1 = ss[i * TV4 + 1u] * dl;
++    var s2 = ss[i * TV4 + 2u] * dl;
++    var s3 = ss[i * TV4 + 3u] * dl;
++    for (var s = 0u; s < n; s++) {
++      let kf = f32(key[((b * uniforms.seq_length + t0 + s) * H + h) * D + i]) * pgbuf[rec * PG + GB + C + s];
++      s0 += kf * ds[s * TV4];
++      s1 += kf * ds[s * TV4 + 1u];
++      s2 += kf * ds[s * TV4 + 2u];
++      s3 += kf * ds[s * TV4 + 3u];
++    }
++    ss[i * TV4] = s0;
++    ss[i * TV4 + 1u] = s1;
++    ss[i * TV4 + 2u] = s2;
++    ss[i * TV4 + 3u] = s3;
++  }
++  workgroupBarrier();
++  for (var j = 0u; j < TV4; j++) {
++    present_state[uniforms.present_slot_offset + state_row + j] = present_state_value_t(ss[i * TV4 + j]);
++  }
++)WGSL";
++  return Status::OK();
+ }
+ 
+ /*
+@@ -204,7 +459,12 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+   TensorShapeVector output_shape({batch_size, seq_length, out_num_heads * head_dim_v});
+   Tensor* output = context.Output(0, output_shape);
+ 
+-  TensorShapeVector state_shape({batch_size, kv_num_heads_, head_dim_k, head_dim_v});
++  // ORT fork (ovis): with state_window = W the state tensors are (W, B, H_kv, d_k, d_v); the past
++  // is slot W-1 and present slot j is the state after token (T - W + j).
++  TensorShape state_shape;
++  ORT_RETURN_IF_ERROR(linear_attention_helper::CheckInputs(
++      state_window_, onnxruntime::narrow<int>(batch_size), kv_num_heads_, onnxruntime::narrow<int>(head_dim_k),
++      onnxruntime::narrow<int>(head_dim_v), past_state, state_shape));
+   Tensor* present_state = context.Output(1, state_shape);
+ 
+   constexpr uint32_t kMaxSupportedWorkgroupSize = 256;
+@@ -264,13 +524,96 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+     }
+   }
+ 
+-  LinearAttentionProgram program{update_rule_, has_initial_state, initial_state_in_present_state,
+-                                 has_decay, has_beta, decay_broadcast_dk, tile_v, components, subgroup_min_size};
++  const bool has_state_window = state_window_ > 0;
++  const uint32_t slot_size_vectorized =
++      onnxruntime::narrow<uint32_t>(batch_size * kv_num_heads_ * head_dim_k * head_dim_v_vectorized);
++  const uint32_t last_slot_offset = has_state_window ? static_cast<uint32_t>(state_window_ - 1) * slot_size_vectorized : 0u;
++
++  // ORT fork (ovis): passes of more than 16 tokens (prefill) take the chunked form; passes of 1-16
++  // tokens (decode steps, speculative verify passes) keep the token loop below, so every row of a
++  // short pass has the arithmetic of a one-token step. With a state window the chunked form covers
++  // tokens [0, T - W) and the token loop the last W tokens, which writes the window slots.
++  bool f32_io = query->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
++                key->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
++                value->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT &&
++                (!has_decay || decay->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) &&
++                (!has_beta || beta->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) &&
++                (!has_initial_state || past_state->GetElementType() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
++  const bool use_chunked = seq_length > 16 && update_rule_ == LinearAttentionUpdateRule::GatedDelta && f32_io &&
++                           has_decay && decay_broadcast_dk && has_beta &&
++                           beta->Shape()[beta->Shape().NumDimensions() - 1] == kv_num_heads_ &&
++                           q_num_heads_ == kv_num_heads_ && n_k_heads == kv_num_heads_ &&
++                           head_dim_k == kChunkHead && head_dim_v == kChunkHead;
++  uint32_t token_start = 0;
++  bool seq_has_initial_state = has_initial_state;
++  bool seq_initial_state_in_present_state = initial_state_in_present_state;
++  if (use_chunked) {
++    const uint32_t prefix_length = onnxruntime::narrow<uint32_t>(seq_length - state_window_);
++    const uint32_t num_chunks = (prefix_length + kChunk - 1) / kChunk;
++    const uint32_t bh = onnxruntime::narrow<uint32_t>(batch_size * kv_num_heads_);
++    const int64_t records = static_cast<int64_t>(bh) * num_chunks;
++    Tensor wbuf = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), TensorShape({records, kChunk, kChunkHead}));
++    Tensor ubuf = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), TensorShape({records, kChunk, kChunkHead}));
++    Tensor pgbuf = context.CreateGPUTensor(DataTypeImpl::GetType<float>(), TensorShape({records, kChunkPG}));
++
++    LinearAttentionChunkPrepProgram prep;
++    prep.AddInputs({{query, ProgramTensorMetadataDependency::TypeAndRank},
++                    {key, ProgramTensorMetadataDependency::TypeAndRank},
++                    {value, ProgramTensorMetadataDependency::TypeAndRank},
++                    {decay, ProgramTensorMetadataDependency::TypeAndRank},
++                    {beta, ProgramTensorMetadataDependency::TypeAndRank}})
++        .AddOutputs({{&wbuf, ProgramTensorMetadataDependency::Rank},
++                     {&ubuf, ProgramTensorMetadataDependency::Rank},
++                     {&pgbuf, ProgramTensorMetadataDependency::Rank}})
++        .SetDispatchGroupSize(onnxruntime::narrow<uint32_t>(records))
++        .SetWorkgroupSize(kChunkHead)
++        .AddUniformVariables({{static_cast<uint32_t>(kv_num_heads_)},
++                              {static_cast<uint32_t>(seq_length)},
++                              {prefix_length},
++                              {num_chunks},
++                              {scale}});
++    ORT_RETURN_IF_ERROR(context.RunProgram(prep));
++
++    const uint32_t num_scan_tiles = static_cast<uint32_t>(head_dim_v / kChunkTileV);
++    LinearAttentionChunkScanProgram scan{has_initial_state, initial_state_in_present_state};
++    scan.AddInputs({{query, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                    {key, ProgramTensorMetadataDependency::TypeAndRank}});
++    if (has_initial_state && !initial_state_in_present_state) {
++      scan.AddInput({past_state, ProgramTensorMetadataDependency::TypeAndRank, 4});
++    }
++    scan.AddInputs({{&wbuf, ProgramTensorMetadataDependency::Rank, 4},
++                    {&ubuf, ProgramTensorMetadataDependency::Rank, 4},
++                    {&pgbuf, ProgramTensorMetadataDependency::Rank}})
++        .AddOutputs({{output, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {present_state, ProgramTensorMetadataDependency::TypeAndRank, 4}})
++        .SetDispatchGroupSize(bh * num_scan_tiles)
++        .SetWorkgroupSize(kChunkHead)
++        .CacheHint(has_initial_state, initial_state_in_present_state)
++        .AddUniformVariables({{static_cast<uint32_t>(kv_num_heads_)},
++                              {static_cast<uint32_t>(seq_length)},
++                              {prefix_length},
++                              {num_chunks},
++                              {num_scan_tiles},
++                              {last_slot_offset},
++                              {last_slot_offset}});
++    ORT_RETURN_IF_ERROR(context.RunProgram(scan));
++    if (!has_state_window) {
++      return Status::OK();
++    }
++    // The last W tokens: token loop from the prefix state, which is now present slot W-1.
++    token_start = prefix_length;
++    seq_has_initial_state = true;
++    seq_initial_state_in_present_state = true;
++  }
++
++  LinearAttentionProgram program{update_rule_, seq_has_initial_state, seq_initial_state_in_present_state,
++                                 has_decay, has_beta, decay_broadcast_dk, tile_v, components, subgroup_min_size,
++                                 has_state_window};
+ 
+   program.AddInputs({{query, ProgramTensorMetadataDependency::TypeAndRank},
+                      {key, ProgramTensorMetadataDependency::TypeAndRank},
+                      {value, ProgramTensorMetadataDependency::TypeAndRank, components}});
+-  if (has_initial_state && !initial_state_in_present_state) {
++  if (seq_has_initial_state && !seq_initial_state_in_present_state) {
+     program.AddInput({past_state, ProgramTensorMetadataDependency::TypeAndRank, components});
+   }
+   if (has_decay) {
+@@ -286,8 +629,8 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+   program.SetDispatchGroupSize(num_workgroups)
+       .SetWorkgroupSize(workgroup_size)
+       .CacheHint(std::to_string(static_cast<int>(update_rule_)),
+-                 has_initial_state, initial_state_in_present_state, has_decay, has_beta,
+-                 decay_broadcast_dk, tile_v, components, subgroup_min_size)
++                 seq_has_initial_state, seq_initial_state_in_present_state, has_decay, has_beta,
++                 decay_broadcast_dk, tile_v, components, subgroup_min_size, has_state_window)
+       .AddUniformVariables({{static_cast<uint32_t>(batch_size)},
+                             {static_cast<uint32_t>(kv_num_heads_)},
+                             {static_cast<uint32_t>(seq_length)},
+@@ -298,7 +641,9 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+                             {static_cast<uint32_t>(heads_per_group)},
+                             {static_cast<uint32_t>(kv_per_k_head)},
+                             {static_cast<uint32_t>(q_num_heads_)},
+-                            {static_cast<uint32_t>(n_k_heads)}});
++                            {static_cast<uint32_t>(n_k_heads)},
++                            {token_start},
++                            {static_cast<uint32_t>(has_state_window ? state_window_ : 1)}});
+ 
+   return context.RunProgram(program);
+ }
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
+index 81346fd..7f505d8 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
+@@ -34,7 +34,7 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+   LinearAttentionProgram(LinearAttentionUpdateRule update_rule, bool has_initial_state,
+                          bool initial_state_in_present_state,
+                          bool has_decay, bool has_beta, bool decay_broadcast_dk, int tile_v, int components,
+-                         int subgroup_min_size)
++                         int subgroup_min_size, bool has_state_window = false)
+       : Program{"LinearAttention"},
+         update_rule_(update_rule),
+         has_initial_state_(has_initial_state),
+@@ -44,7 +44,8 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+         decay_broadcast_dk_(decay_broadcast_dk),
+         tile_v_(tile_v),
+         components_(components),
+-        subgroup_min_size_(subgroup_min_size) {}
++        subgroup_min_size_(subgroup_min_size),
++        has_state_window_(has_state_window) {}
+ 
+   Status GenerateShaderCode(ShaderHelper& sh) const override;
+ 
+@@ -59,7 +60,11 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+       {"heads_per_group", ProgramUniformVariableDataType::Uint32},
+       {"kv_per_k_head", ProgramUniformVariableDataType::Uint32},
+       {"q_num_heads", ProgramUniformVariableDataType::Uint32},
+-      {"n_k_heads", ProgramUniformVariableDataType::Uint32});
++      {"n_k_heads", ProgramUniformVariableDataType::Uint32},
++      // ORT fork (ovis): first token this dispatch processes (0, or the chunked prefix length when
++      // the chunked prefill ran first) and the state window W (1 when state_window = 0).
++      {"token_start", ProgramUniformVariableDataType::Uint32},
++      {"state_window", ProgramUniformVariableDataType::Uint32});
+ 
+  private:
+   LinearAttentionUpdateRule update_rule_;
+@@ -71,6 +76,47 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+   int tile_v_;
+   int components_;
+   int subgroup_min_size_;
++  bool has_state_window_;  // ORT fork (ovis): state tensors carry a leading window axis
++};
++
++// ORT fork (ovis): chunked gated-delta-rule prefill for passes of more than 16 tokens.
++// Pass 1 (ChunkPrep, one workgroup per (batch, head, chunk)): from the chunk's keys, decays and
++// betas it builds T = (I + A)^-1 (A[t][s] = beta_t exp(gc_t - gc_s) k_t.k_s, s < t), then
++// W = T diag(beta exp(gc)) K, U = T diag(beta) V, P[t][s] = scale exp(gc_t - gc_s) q_t.k_s (s <= t),
++// and the decay factors. Pass 2 (ChunkScan, one workgroup per (batch, head, 16 value columns))
++// walks the chunks in order with the state tile in workgroup memory:
++//   delta = U - W S;  out = scale exp(gc) Q S + P delta;  S = exp(gc_last) S + (exp(gc_last - gc) K)^T delta.
++class LinearAttentionChunkPrepProgram final : public Program<LinearAttentionChunkPrepProgram> {
++ public:
++  LinearAttentionChunkPrepProgram() : Program{"LinearAttentionChunkPrep"} {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"num_heads", ProgramUniformVariableDataType::Uint32},
++      {"seq_length", ProgramUniformVariableDataType::Uint32},
++      {"prefix_length", ProgramUniformVariableDataType::Uint32},
++      {"num_chunks", ProgramUniformVariableDataType::Uint32},
++      {"scale", ProgramUniformVariableDataType::Float32});
++};
++
++class LinearAttentionChunkScanProgram final : public Program<LinearAttentionChunkScanProgram> {
++ public:
++  LinearAttentionChunkScanProgram(bool has_initial_state, bool initial_state_in_present_state)
++      : Program{"LinearAttentionChunkScan"},
++        has_initial_state_(has_initial_state),
++        initial_state_in_present_state_(initial_state_in_present_state) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"num_heads", ProgramUniformVariableDataType::Uint32},
++      {"seq_length", ProgramUniformVariableDataType::Uint32},
++      {"prefix_length", ProgramUniformVariableDataType::Uint32},
++      {"num_chunks", ProgramUniformVariableDataType::Uint32},
++      {"num_dv_tiles", ProgramUniformVariableDataType::Uint32},
++      {"past_slot_offset", ProgramUniformVariableDataType::Uint32},
++      {"present_slot_offset", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool has_initial_state_;
++  bool initial_state_in_present_state_;
+ };
+ 
+ // Kernel for LinearAttention
+@@ -84,6 +130,7 @@ class LinearAttention : public WebGpuKernel {
+   float scale_;
+   int q_num_heads_;
+   int kv_num_heads_;
++  int state_window_;  // ORT fork (ovis): 0 or W (state_window attribute)
+ };
+ 
+ }  // namespace webgpu
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
+index 1ac2214..5501208 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
++++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.wgsl.template
+@@ -20,6 +20,7 @@
+ #param initial_state_in_present_state
+ #param decay_broadcast_dk
+ #param tile_v
++#param has_state_window
+ #param subgroup_min_size // 0 = disable subgroup reduction
+ 
+ // Update rule constants
+@@ -94,10 +95,19 @@ $MAIN {
+   // Initialize state tile in private memory
+   var state: array<vtype, TILE_V>;
+ 
++#if has_state_window
++  // ORT fork (ovis): state tensors are (W, B, H, dk, dv). The past is slot W-1; present slot j is
++  // the state after token (seq_length - W + j).
++  let slot_size = uniforms.batch_size * uniforms.num_heads * uniforms.head_dim_k * uniforms.head_dim_v;
++  let past_slot = (uniforms.state_window - 1u) * slot_size;
++#else
++  let past_slot = 0u;
++#endif
++
+   // Load initial state if provided
+ #if has_initial_state
+   if (dk_idx < uniforms.head_dim_k) {
+-    let state_base = ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
++    let state_base = past_slot + ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
+     for (var j = 0u; j < TILE_V; j++) {
+       if (dv_start + j < uniforms.head_dim_v) {
+ #if initial_state_in_present_state
+@@ -111,7 +121,7 @@ $MAIN {
+ #endif
+ 
+   // Process each token sequentially
+-  for (var t = 0u; t < uniforms.seq_length; t++) {
++  for (var t = uniforms.token_start; t < uniforms.seq_length; t++) {
+     let bt_offset = batch_idx * uniforms.seq_length + t;
+     var k_val: f32 = 0.0;
+     if (dk_idx < uniforms.head_dim_k) {
+@@ -406,9 +416,34 @@ $MAIN {
+ #endif
+       workgroupBarrier();
+     }
++#endif
++#if has_state_window
++    // ORT fork (ovis): the state after token t goes to slot t + W - T when t is one of the last W.
++    if (t + uniforms.state_window >= uniforms.seq_length && dk_idx < uniforms.head_dim_k) {
++      let slot = t + uniforms.state_window - uniforms.seq_length;
++      let state_base = slot * slot_size + ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
++      for (var j = 0u; j < TILE_V; j++) {
++        if (dv_start + j < uniforms.head_dim_v) {
++          present_state[state_base + j] = otype(state[j]);
++        }
++      }
++    }
+ #endif
+   } // end token loop
+ 
++#if has_state_window
++  // Slots below W - T hold no token of this call: zeros.
++  if (uniforms.state_window > uniforms.seq_length && dk_idx < uniforms.head_dim_k) {
++    for (var slot = 0u; slot < uniforms.state_window - uniforms.seq_length; slot++) {
++      let state_base = slot * slot_size + ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
++      for (var j = 0u; j < TILE_V; j++) {
++        if (dv_start + j < uniforms.head_dim_v) {
++          present_state[state_base + j] = otype(0.0);
++        }
++      }
++    }
++  }
++#else
+   // Write present_state
+   if (dk_idx < uniforms.head_dim_k) {
+     let state_base = ((batch_idx * uniforms.num_heads + head_idx) * uniforms.head_dim_k + dk_idx) * uniforms.head_dim_v + dv_start;
+@@ -418,4 +453,5 @@ $MAIN {
+       }
+     }
+   }
++#endif
+ } // MAIN
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc
+index 8645d07..8ce7c0c 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc
++++ b/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc
+@@ -30,6 +30,8 @@ ONNX_OPERATOR_KERNEL_EX(
+ MultiHeadAttention::MultiHeadAttention(const OpKernelInfo& info)
+     : WebGpuKernel(info), AttentionBase(info, false) {
+   // Unidirectional attention is now supported for both flash attention and normal attention paths
++  // ORT fork (ovis): the session may opt in to the tiled flash-attention prefill.
++  flash_attention_tiled_ = info.GetConfigOptions().GetConfigOrDefault("webgpu.flash_attention_tiled", "0") == "1";
+ }
+ 
+ Status MultiHeadAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
+@@ -77,6 +79,7 @@ Status MultiHeadAttention::ComputeInternal(onnxruntime::webgpu::ComputeContext&
+                                                                       kMultiHeadAttention,
+                                                                       context.DeviceLimits().maxComputeInvocationsPerWorkgroup));
+   WebgpuAttentionParameters parameters(params);
++  parameters.flash_attention_tiled_ = flash_attention_tiled_;
+   TensorShapeVector output_shape(3);
+   output_shape[0] = static_cast<int64_t>(parameters.batch_size_);
+   output_shape[1] = static_cast<int64_t>(parameters.sequence_length_);
+diff --git a/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.h b/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.h
+index d983236..0bdfb0d 100644
+--- a/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.h
++++ b/onnxruntime/contrib_ops/webgpu/bert/multihead_attention.h
+@@ -21,6 +21,9 @@ class MultiHeadAttention final : public WebGpuKernel, public AttentionBase {
+  public:
+   MultiHeadAttention(const OpKernelInfo& info);
+   Status ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const override;
++
++ private:
++  bool flash_attention_tiled_ = false;  // ORT fork (ovis): session config "webgpu.flash_attention_tiled"
+ };
+ 
+ }  // namespace webgpu
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc b/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc
 index c0e3b74..a1bf44f 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/skip_layer_norm.cc

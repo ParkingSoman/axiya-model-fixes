@@ -29,6 +29,19 @@
 #     conv state after each of the last W positions (W <= 16), so a speculative
 #     pass can roll back to an accepted prefix. The app fuses the decoder's
 #     conv layers into this op at load (VITE_CONV_STATE, src/conv-state.js).
+#   - LinearAttention on WebGPU (ovis, fork branch ovis-speed): state_window W
+#     (<= 16) keeps the recurrent state after each of the last W tokens
+#     (state tensors (W, B, H, dk, dv); the op reads slot W-1), so an
+#     OvisOCR2 verify pass can roll back to an accepted prefix. Passes of more
+#     than 16 tokens (the prompt step) take a chunked gated-delta prefill
+#     (LinearAttentionChunkPrep + LinearAttentionChunkScan); passes of 1-16
+#     tokens keep the token loop, so each row has the arithmetic of a
+#     one-token step.
+#   - Tiled fp16 attention (ovis): a session that sets the config entry
+#     webgpu.flash_attention_tiled=1 runs the 16-bit, head-64 MultiHeadAttention
+#     prefill as FlashAttentionTiled. Only the OvisOCR2 image reader sets it
+#     (lock runtime.visionAttention 'tiled'); other sessions keep the default
+#     programs.
 #   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
 #     (FUSED_DECODE below).
 #   - SplitMaskedSoftmax (P5, com.microsoft, WebGPU only): the gemma12b
@@ -173,6 +186,19 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'ParseStateWindow(info, state_window_)' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.cc &&
     grep -q '#if output_present_state && has_state_window' onnxruntime/contrib_ops/webgpu/bert/causal_conv_with_state.wgsl.template || {
       echo "reference patch lacks the K5 CausalConvWithState state window; refusing" >&2; exit 1; }
+  # ovis: LinearAttention state window and chunked prefill on WebGPU, and the
+  # opt-in tiled fp16 attention prefill (session config webgpu.flash_attention_tiled).
+  la=onnxruntime/contrib_ops/webgpu/bert/linear_attention
+  grep -q 'ORT_THROW_IF_ERROR(linear_attention_helper::ParseStateWindow(info, state_window_));' $la.cc &&
+    grep -q '^#if has_state_window$' $la.wgsl.template &&
+    grep -q 'Status LinearAttentionChunkPrepProgram::GenerateShaderCode' $la.cc &&
+    grep -q 'Status LinearAttentionChunkScanProgram::GenerateShaderCode' $la.cc &&
+    grep -q 'const bool use_chunked = seq_length > 16' $la.cc || {
+      echo "reference patch lacks the ovis LinearAttention state window / chunked prefill; refusing" >&2; exit 1; }
+  grep -q 'class FlashAttentionTiledProgram final' onnxruntime/contrib_ops/webgpu/bert/flash_attention.h &&
+    grep -q 'if (parameters.flash_attention_tiled_ && is_fp16_q && parameters.head_size_ == 64' onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc &&
+    grep -q 'GetConfigOrDefault("webgpu.flash_attention_tiled", "0") == "1"' onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc || {
+      echo "reference patch lacks the ovis tiled fp16 attention (webgpu.flash_attention_tiled); refusing" >&2; exit 1; }
   # P5: the fused split-cache attention softmax (com.microsoft SplitMaskedSoftmax),
   # which a gemma12b decoder built with build.py --fuse-softmax needs.
   grep -q 'SplitMaskedSoftmax)>' onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc &&
