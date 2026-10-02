@@ -42,6 +42,13 @@
 #     prefill as FlashAttentionTiled. Only the OvisOCR2 image reader sets it
 #     (lock runtime.visionAttention 'tiled'); other sessions keep the default
 #     programs.
+#   - Opt-in decode programs (ovis2, fork branch ovis-speed2): a session that
+#     sets the config entry webgpu.matmulnbits_block=1 runs the q4, block-32,
+#     f32 MatMulNBits for 1-16 rows as MatMulNBitsBlock (one 32-value block
+#     per thread step); webgpu.linear_attention_decode=1 runs LinearAttention
+#     passes of 1-16 tokens as LinearAttentionDecode (gated-delta token loop).
+#     Only the OvisOCR2 decoder and drafter sessions set them (lock
+#     runtime.decoderKernels); other sessions keep the default programs.
 #   - Fused MatMulNBitsMlp/Qkv one-token decode programs: kept by default
 #     (FUSED_DECODE below).
 #   - SplitMaskedSoftmax (P5, com.microsoft, WebGPU only): the gemma12b
@@ -199,6 +206,16 @@ if [ "$PATCH" = 1 ] && [ "$(cd "$(dirname "$patch_file")" && pwd)/$(basename "$p
     grep -q 'if (parameters.flash_attention_tiled_ && is_fp16_q && parameters.head_size_ == 64' onnxruntime/contrib_ops/webgpu/bert/flash_attention.cc &&
     grep -q 'GetConfigOrDefault("webgpu.flash_attention_tiled", "0") == "1"' onnxruntime/contrib_ops/webgpu/bert/multihead_attention.cc || {
       echo "reference patch lacks the ovis tiled fp16 attention (webgpu.flash_attention_tiled); refusing" >&2; exit 1; }
+  # ovis2: opt-in MatMulNBitsBlock and LinearAttentionDecode (session config
+  # webgpu.matmulnbits_block / webgpu.linear_attention_decode).
+  grep -q 'class MatMulNBitsBlockProgram final' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h &&
+    grep -q 'GetConfigOrDefault("webgpu.matmulnbits_block", "0") == "1"' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h &&
+    grep -q 'Status MatMulNBitsBlockProgram::GenerateShaderCode' onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc || {
+      echo "reference patch lacks the ovis2 MatMulNBitsBlock (webgpu.matmulnbits_block); refusing" >&2; exit 1; }
+  grep -q 'class LinearAttentionDecodeProgram final' $la.h &&
+    grep -q 'Status LinearAttentionDecodeProgram::GenerateShaderCode' $la.cc &&
+    grep -q 'GetConfigOrDefault("webgpu.linear_attention_decode", "0") == "1"' $la.cc || {
+      echo "reference patch lacks the ovis2 LinearAttentionDecode (webgpu.linear_attention_decode); refusing" >&2; exit 1; }
   # P5: the fused split-cache attention softmax (com.microsoft SplitMaskedSoftmax),
   # which a gemma12b decoder built with build.py --fuse-softmax needs.
   grep -q 'SplitMaskedSoftmax)>' onnxruntime/contrib_ops/webgpu/webgpu_contrib_kernels.cc &&

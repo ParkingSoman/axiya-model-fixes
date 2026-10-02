@@ -1393,7 +1393,7 @@ index 00807f3..57b5b63 100644
          qNorm = context.CreateGPUTensor(query->DataType(), query->Shape());
          kNorm = context.CreateGPUTensor(key->DataType(), key->Shape());
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
-index 570effd..b74c12b 100644
+index 570effd..e874e27 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
 +++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.cc
 @@ -4,6 +4,7 @@
@@ -1412,7 +1412,7 @@ index 570effd..b74c12b 100644
                               WGSL_TEMPLATE_PARAMETER(initial_state_in_present_state, initial_state_in_present_state_),
                               WGSL_TEMPLATE_PARAMETER(subgroup_min_size, subgroup_min_size_),
                               WGSL_TEMPLATE_PARAMETER(tile_v, tile_v_),
-@@ -110,8 +112,261 @@ LinearAttention::LinearAttention(const OpKernelInfo& info)
+@@ -110,8 +112,374 @@ LinearAttention::LinearAttention(const OpKernelInfo& info)
    scale_ = info.GetAttrOrDefault<float>("scale", 0.0f);
    q_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("q_num_heads"));
    kv_num_heads_ = static_cast<int>(info.GetAttr<int64_t>("kv_num_heads"));
@@ -1420,6 +1420,119 @@ index 570effd..b74c12b 100644
 -              "WebGPU LinearAttention does not support state_window > 0 (CUDA EP only)");
 +  // ORT fork (ovis): state_window W > 0 keeps the state after each of the last W tokens.
 +  ORT_THROW_IF_ERROR(linear_attention_helper::ParseStateWindow(info, state_window_));
++  decode_program_ = info.GetConfigOptions().GetConfigOrDefault("webgpu.linear_attention_decode", "0") == "1";
++}
++
++Status LinearAttentionDecodeProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("query", ShaderUsage::UseUniform);
++  shader.AddInput("key", ShaderUsage::UseUniform);
++  shader.AddInput("value", ShaderUsage::UseUniform);  // vec4
++  if (has_initial_state_ && !initial_state_in_present_state_) {
++    shader.AddInput("initial_state", ShaderUsage::UseUniform);  // vec4
++  }
++  shader.AddInput("decay", ShaderUsage::UseUniform);
++  shader.AddInput("beta", ShaderUsage::UseUniform);
++  shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);         // vec4
++  shader.AddOutput("present_state", ShaderUsage::UseUniform | ShaderUsage::UseValueTypeAlias);  // vec4
++  shader.AdditionalImplementation()
++      << "const D: u32 = 128u;\n"
++         "const D4: u32 = 32u;\n"
++         "const NT: u32 = 32u;\n"  // threads
++         "var<workgroup> red_ret: array<vec4<f32>, NT * 2u>;\n"
++         "var<workgroup> red_pre: array<vec4<f32>, NT * 2u>;\n"
++         "var<workgroup> red_kq: array<f32, NT>;\n"
++         "var<workgroup> bcast: array<vec4<f32>, 2u>;\n";
++  auto& b = shader.MainFunctionBody();
++  b << R"WGSL(
++  let H = uniforms.num_heads;
++  let bh = workgroup_idx / 16u;          // 16 tiles of 8 value columns per head
++  let tile = workgroup_idx % 16u;
++  let batch = bh / H;
++  let h = bh % H;
++  let t = local_idx;
++  let col4 = tile * 2u;                  // first vec4 column
++  let slot_size = uniforms.batch_size * H * D * D4;
++)WGSL";
++  if (has_state_window_) {
++    b << "  let past_slot = (uniforms.state_window - 1u) * slot_size;\n";
++  } else {
++    b << "  let past_slot = 0u;\n";
++  }
++  b << "  var s: array<vec4<f32>, 8>;  // [row r][column j] at r * 2 + j, row k = t + 32 r\n";
++  b << "  for (var r = 0u; r < 4u; r++) {\n"
++       "    let base = past_slot + (bh * D + t + 32u * r) * D4 + col4;\n";
++  if (has_initial_state_) {
++    b << (initial_state_in_present_state_ ? "    s[r * 2u] = vec4<f32>(present_state[base]); s[r * 2u + 1u] = vec4<f32>(present_state[base + 1u]);\n"
++                                          : "    s[r * 2u] = vec4<f32>(initial_state[base]); s[r * 2u + 1u] = vec4<f32>(initial_state[base + 1u]);\n");
++  } else {
++    b << "    s[r * 2u] = vec4<f32>(0.0); s[r * 2u + 1u] = vec4<f32>(0.0);\n";
++  }
++  b << "  }\n";
++  b << R"WGSL(
++  for (var tok = uniforms.token_start; tok < uniforms.seq_length; tok++) {
++    let bt = batch * uniforms.seq_length + tok;
++    let qk_base = (bt * H + h) * D + t;
++    let k0 = f32(key[qk_base]); let k1 = f32(key[qk_base + 32u]); let k2 = f32(key[qk_base + 64u]); let k3 = f32(key[qk_base + 96u]);
++    let q0 = f32(query[qk_base]); let q1 = f32(query[qk_base + 32u]); let q2 = f32(query[qk_base + 64u]); let q3 = f32(query[qk_base + 96u]);
++    let eg = exp(f32(decay[bt * H + h]));
++    for (var i = 0u; i < 8u; i++) { s[i] *= eg; }
++    red_ret[t * 2u] = s[0] * k0 + s[2] * k1 + s[4] * k2 + s[6] * k3;
++    red_ret[t * 2u + 1u] = s[1] * k0 + s[3] * k1 + s[5] * k2 + s[7] * k3;
++    red_pre[t * 2u] = s[0] * q0 + s[2] * q1 + s[4] * q2 + s[6] * q3;
++    red_pre[t * 2u + 1u] = s[1] * q0 + s[3] * q1 + s[5] * q2 + s[7] * q3;
++    red_kq[t] = k0 * q0 + k1 * q1 + k2 * q2 + k3 * q3;
++    workgroupBarrier();
++    for (var stride = NT / 2u; stride > 0u; stride = stride / 2u) {
++      if (t < stride) {
++        red_ret[t * 2u] += red_ret[(t + stride) * 2u];
++        red_ret[t * 2u + 1u] += red_ret[(t + stride) * 2u + 1u];
++        red_pre[t * 2u] += red_pre[(t + stride) * 2u];
++        red_pre[t * 2u + 1u] += red_pre[(t + stride) * 2u + 1u];
++        red_kq[t] += red_kq[t + stride];
++      }
++      workgroupBarrier();
++    }
++    if (t < 2u) {
++      let bv = f32(beta[bt * H + h]);
++      let v = vec4<f32>(value[(bt * H + h) * D4 + col4 + t]);
++      let d = bv * (v - red_ret[t]);
++      bcast[t] = d;
++      output[(bt * H + h) * D4 + col4 + t] = output_value_t((red_pre[t] + d * red_kq[0]) * uniforms.scale);
++    }
++    workgroupBarrier();
++    let d0 = bcast[0];
++    let d1 = bcast[1];
++    s[0] += k0 * d0; s[1] += k0 * d1;
++    s[2] += k1 * d0; s[3] += k1 * d1;
++    s[4] += k2 * d0; s[5] += k2 * d1;
++    s[6] += k3 * d0; s[7] += k3 * d1;
++)WGSL";
++  if (has_state_window_) {
++    b << "    if (tok + uniforms.state_window >= uniforms.seq_length) {\n"
++         "      let sl = (tok + uniforms.state_window - uniforms.seq_length) * slot_size;\n"
++         "      for (var r = 0u; r < 4u; r++) {\n"
++         "        let base = sl + (bh * D + t + 32u * r) * D4 + col4;\n"
++         "        present_state[base] = present_state_value_t(s[r * 2u]); present_state[base + 1u] = present_state_value_t(s[r * 2u + 1u]);\n"
++         "      }\n"
++         "    }\n";
++  }
++  b << "  }\n";
++  if (has_state_window_) {
++    b << "  if (uniforms.state_window > uniforms.seq_length) {\n"
++         "    for (var sl = 0u; sl < uniforms.state_window - uniforms.seq_length; sl++) {\n"
++         "      for (var r = 0u; r < 4u; r++) {\n"
++         "        let base = sl * slot_size + (bh * D + t + 32u * r) * D4 + col4;\n"
++         "        present_state[base] = present_state_value_t(0.0); present_state[base + 1u] = present_state_value_t(0.0);\n"
++         "      }\n"
++         "    }\n"
++         "  }\n";
++  } else {
++    b << "  for (var r = 0u; r < 4u; r++) {\n"
++         "    let base = (bh * D + t + 32u * r) * D4 + col4;\n"
++         "    present_state[base] = present_state_value_t(s[r * 2u]); present_state[base + 1u] = present_state_value_t(s[r * 2u + 1u]);\n"
++         "  }\n";
++  }
++  return Status::OK();
 +}
 +
 +// =============================================================================
@@ -1676,7 +1789,7 @@ index 570effd..b74c12b 100644
  }
  
  /*
-@@ -204,7 +459,12 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+@@ -204,7 +572,12 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
    TensorShapeVector output_shape({batch_size, seq_length, out_num_heads * head_dim_v});
    Tensor* output = context.Output(0, output_shape);
  
@@ -1690,7 +1803,7 @@ index 570effd..b74c12b 100644
    Tensor* present_state = context.Output(1, state_shape);
  
    constexpr uint32_t kMaxSupportedWorkgroupSize = 256;
-@@ -264,13 +524,96 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+@@ -264,13 +637,123 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
      }
    }
  
@@ -1778,6 +1891,33 @@ index 570effd..b74c12b 100644
 +    seq_initial_state_in_present_state = true;
 +  }
 +
++  // ORT fork (ovis): opt-in small-pass program (see LinearAttentionDecodeProgram).
++  if (decode_program_ && seq_length - token_start <= 16 && update_rule_ == LinearAttentionUpdateRule::GatedDelta && f32_io &&
++      has_decay && decay_broadcast_dk && has_beta && beta->Shape()[beta->Shape().NumDimensions() - 1] == kv_num_heads_ &&
++      q_num_heads_ == kv_num_heads_ && n_k_heads == kv_num_heads_ && head_dim_k == 128 && head_dim_v == 128) {
++    LinearAttentionDecodeProgram dprog{seq_has_initial_state, seq_initial_state_in_present_state, has_state_window};
++    dprog.AddInputs({{query, ProgramTensorMetadataDependency::TypeAndRank},
++                     {key, ProgramTensorMetadataDependency::TypeAndRank},
++                     {value, ProgramTensorMetadataDependency::TypeAndRank, 4}});
++    if (seq_has_initial_state && !seq_initial_state_in_present_state) {
++      dprog.AddInput({past_state, ProgramTensorMetadataDependency::TypeAndRank, 4});
++    }
++    dprog.AddInputs({{decay, ProgramTensorMetadataDependency::TypeAndRank},
++                     {beta, ProgramTensorMetadataDependency::TypeAndRank}})
++        .AddOutputs({{output, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {present_state, ProgramTensorMetadataDependency::TypeAndRank, 4}})
++        .SetDispatchGroupSize(onnxruntime::narrow<uint32_t>(batch_size * kv_num_heads_ * 16))
++        .SetWorkgroupSize(32)
++        .CacheHint(seq_has_initial_state, seq_initial_state_in_present_state, has_state_window)
++        .AddUniformVariables({{static_cast<uint32_t>(batch_size)},
++                              {static_cast<uint32_t>(kv_num_heads_)},
++                              {static_cast<uint32_t>(seq_length)},
++                              {token_start},
++                              {static_cast<uint32_t>(has_state_window ? state_window_ : 1)},
++                              {scale}});
++    return context.RunProgram(dprog);
++  }
++
 +  LinearAttentionProgram program{update_rule_, seq_has_initial_state, seq_initial_state_in_present_state,
 +                                 has_decay, has_beta, decay_broadcast_dk, tile_v, components, subgroup_min_size,
 +                                 has_state_window};
@@ -1790,7 +1930,7 @@ index 570effd..b74c12b 100644
      program.AddInput({past_state, ProgramTensorMetadataDependency::TypeAndRank, components});
    }
    if (has_decay) {
-@@ -286,8 +629,8 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+@@ -286,8 +769,8 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
    program.SetDispatchGroupSize(num_workgroups)
        .SetWorkgroupSize(workgroup_size)
        .CacheHint(std::to_string(static_cast<int>(update_rule_)),
@@ -1801,7 +1941,7 @@ index 570effd..b74c12b 100644
        .AddUniformVariables({{static_cast<uint32_t>(batch_size)},
                              {static_cast<uint32_t>(kv_num_heads_)},
                              {static_cast<uint32_t>(seq_length)},
-@@ -298,7 +641,9 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
+@@ -298,7 +781,9 @@ Status LinearAttention::ComputeInternal(ComputeContext& context) const {
                              {static_cast<uint32_t>(heads_per_group)},
                              {static_cast<uint32_t>(kv_per_k_head)},
                              {static_cast<uint32_t>(q_num_heads_)},
@@ -1813,7 +1953,7 @@ index 570effd..b74c12b 100644
    return context.RunProgram(program);
  }
 diff --git a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
-index 81346fd..7f505d8 100644
+index 81346fd..e513146 100644
 --- a/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
 +++ b/onnxruntime/contrib_ops/webgpu/bert/linear_attention.h
 @@ -34,7 +34,7 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
@@ -1848,7 +1988,7 @@ index 81346fd..7f505d8 100644
  
   private:
    LinearAttentionUpdateRule update_rule_;
-@@ -71,6 +76,47 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
+@@ -71,6 +76,75 @@ class LinearAttentionProgram final : public Program<LinearAttentionProgram> {
    int tile_v_;
    int components_;
    int subgroup_min_size_;
@@ -1893,14 +2033,43 @@ index 81346fd..7f505d8 100644
 + private:
 +  bool has_initial_state_;
 +  bool initial_state_in_present_state_;
++};
++
++// ORT fork (ovis): token loop for passes of 1-16 tokens, opt-in per session
++// ("webgpu.linear_attention_decode" = "1"; gated_delta, H_q = H_k = H_kv, per-head decay,
++// dk = dv = 128, float32). One workgroup of 32 threads per (batch, head, 8 value columns): a thread
++// owns 4 state rows (k = t, t + 32, t + 64, t + 96) x 2 vec4 columns in registers, so the
++// sums over dk are 4 rows in registers and a 5-level tree (the default program: 1 row, a 7-level
++// tree, 128 threads, 512 workgroups for 16 heads). Same state-window rules as the default program.
++class LinearAttentionDecodeProgram final : public Program<LinearAttentionDecodeProgram> {
++ public:
++  LinearAttentionDecodeProgram(bool has_initial_state, bool initial_state_in_present_state, bool has_state_window)
++      : Program{"LinearAttentionDecode"},
++        has_initial_state_(has_initial_state),
++        initial_state_in_present_state_(initial_state_in_present_state),
++        has_state_window_(has_state_window) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"batch_size", ProgramUniformVariableDataType::Uint32},
++      {"num_heads", ProgramUniformVariableDataType::Uint32},
++      {"seq_length", ProgramUniformVariableDataType::Uint32},
++      {"token_start", ProgramUniformVariableDataType::Uint32},
++      {"state_window", ProgramUniformVariableDataType::Uint32},
++      {"scale", ProgramUniformVariableDataType::Float32});
++
++ private:
++  bool has_initial_state_;
++  bool initial_state_in_present_state_;
++  bool has_state_window_;
  };
  
  // Kernel for LinearAttention
-@@ -84,6 +130,7 @@ class LinearAttention : public WebGpuKernel {
+@@ -84,6 +158,8 @@ class LinearAttention : public WebGpuKernel {
    float scale_;
    int q_num_heads_;
    int kv_num_heads_;
 +  int state_window_;  // ORT fork (ovis): 0 or W (state_window attribute)
++  bool decode_program_ = false;  // ORT fork (ovis): session config webgpu.linear_attention_decode
  };
  
  }  // namespace webgpu
@@ -2691,10 +2860,10 @@ index 49b51d3..776af50 100644
                                    const Tensor* zero_points, const Tensor* bias,
                                    uint32_t batch_count,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-index 45baa67..08b1b37 100644
+index 45baa67..eec56cc 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.cc
-@@ -112,6 +112,39 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
+@@ -112,6 +112,181 @@ Status MatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                               WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
  }
  
@@ -2731,10 +2900,165 @@ index 45baa67..08b1b37 100644
 +                             WGSL_TEMPLATE_VARIABLE(scales_b, scales_b));
 +}
 +
++
++// ORT fork (ovis): see MatMulNBitsBlockProgram in matmul_nbits.h.
++constexpr uint32_t kBlockRows = 4;
++constexpr uint32_t kBlockLanes = 8;
++constexpr uint32_t kBlockGroups = 8;
++constexpr uint32_t kBlockCols = 4;
++
++Status MatMulNBitsBlockProgram::GenerateShaderCode(ShaderHelper& shader) const {
++  shader.AddInput("a", ShaderUsage::UseUniform);       // vec4<f32>
++  shader.AddInput("b", ShaderUsage::UseUniform);       // vec4<u32>: one 32-value block
++  shader.AddInput("scales", ShaderUsage::UseUniform);  // f32
++  if (has_zero_points_) {
++    shader.AddInput("zero_points", ShaderUsage::UseUniform);  // u32: 8 packed 4-bit zero points
++  }
++  if (has_bias_) {
++    shader.AddInput("bias", ShaderUsage::UseUniform);
++  }
++  shader.AddOutput("output", ShaderUsage::UseUniform);
++  const uint32_t cols_per_wg = kBlockCols * kBlockGroups;
++  const uint32_t threads = kBlockLanes * kBlockGroups;
++  auto& impl = shader.AdditionalImplementation();
++  impl << "const cols_per_wg = " << cols_per_wg << "u;\n"
++       << "var<workgroup> partials: array<array<f32, " << kBlockLanes << ">, " << kBlockRows * cols_per_wg << ">;\n";
++  if (has_zero_points_) {
++    impl << "fn zero(col: u32, blk: u32) -> f32 { let off = col * uniforms.zero_blocks_per_col + blk; "
++            "return f32((zero_points[off / 8u] >> ((off % 8u) * 4u)) & 0xFu); }\n";
++  } else {
++    impl << "fn zero(col: u32, blk: u32) -> f32 { return 8.0; }\n";
++  }
++  impl << "fn store_row(r: u32, group: u32, lane: u32, acc: vec4<f32>) {\n"
++          "  let slot = r * cols_per_wg + group * 4u;\n"
++          "  partials[slot][lane] = acc.x; partials[slot + 1u][lane] = acc.y; partials[slot + 2u][lane] = acc.z; partials[slot + 3u][lane] = acc.w;\n"
++          "}\n"
++          "fn reduce_phase(batch: u32, row0: u32, rows: u32, n_base: u32, lidx: u32) {\n"
++          "  for (var t = lidx; t < " << kBlockRows * cols_per_wg << "u; t += " << threads << "u) {\n"
++          "    let r = t / cols_per_wg; let col = n_base + t % cols_per_wg;\n"
++          "    if (r < rows && col < uniforms.N) {\n"
++          "      var v = 0.0;\n"
++          "      for (var l = 0u; l < " << kBlockLanes << "u; l++) { v += partials[t][l]; }\n";
++  if (has_bias_) {
++    impl << "      v += f32(bias[col]);\n";
++  }
++  impl << "      output[(batch * uniforms.M + row0 + r) * uniforms.N + col] = v;\n"
++          "    }\n"
++          "  }\n"
++          "}\n";
++  auto& body = shader.MainFunctionBody();
++  body << "  let tiles = uniforms.num_N_tile * uniforms.num_M_tile;\n"
++          "  if (workgroup_idx >= tiles * uniforms.batch_count) { return; }\n"
++          "  let batch = workgroup_idx / tiles;\n"
++          "  let m_tile = (workgroup_idx % tiles) / uniforms.num_N_tile;\n"
++          "  let n_base = (workgroup_idx % uniforms.num_N_tile) * cols_per_wg;\n"
++          "  let row0 = m_tile * uniforms.rows_per_tile;\n"
++          "  let rows = min(uniforms.rows_per_tile, uniforms.M - row0);\n"
++          "  let lane = local_idx % " << kBlockLanes << "u;\n"
++          "  let group = local_idx / " << kBlockLanes << "u;\n"
++          "  let col0 = n_base + group * 4u;\n"
++          "  let a_base = (batch * uniforms.M + row0) * uniforms.K_of_a;\n";
++  for (uint32_t r = 0; r < kBlockRows; r++) body << "  var acc" << r << " = vec4<f32>(0.0);\n";
++  body << "  for (var blk = lane; blk < uniforms.blocks_per_col; blk += " << kBlockLanes << "u) {\n";
++  for (uint32_t c = 0; c < kBlockCols; c++) {
++    body << "    let col" << c << " = min(col0 + " << c << "u, uniforms.N - 1u);\n"
++         << "    let q" << c << " = b[col" << c << " * uniforms.blocks_per_col + blk];\n"
++         << "    let s" << c << " = f32(scales[col" << c << " * uniforms.blocks_per_col + blk]);\n"
++         << "    let z" << c << " = zero(col" << c << ", blk);\n";
++  }
++  body << "    let sv = vec4<f32>(s0, s1, s2, s3);\n"
++          "    let zv = vec4<f32>(z0, z1, z2, z3);\n";
++  // Row r: its own copy of the same code. Word j of a block holds k = 8j .. 8j+7, element 2i in
++  // the low nibble of byte i.
++  for (uint32_t r = 0; r < kBlockRows; r++) {
++    body << "    if (rows > " << r << "u) {\n"
++         << "      let ab = a_base + " << r << "u * uniforms.K_of_a + blk * 8u;\n";
++    for (uint32_t j = 0; j < 4; j++) {
++      body << "      let x" << j << "0 = vec4<f32>(a[ab + " << 2 * j << "u]); let x" << j << "1 = vec4<f32>(a[ab + " << 2 * j + 1 << "u]);\n"
++           << "      let ae" << j << " = vec4<f32>(x" << j << "0.x, x" << j << "0.z, x" << j << "1.x, x" << j << "1.z);\n"
++           << "      let ao" << j << " = vec4<f32>(x" << j << "0.y, x" << j << "0.w, x" << j << "1.y, x" << j << "1.w);\n";
++    }
++    body << "      let sa = dot(ae0 + ae1 + ae2 + ae3 + ao0 + ao1 + ao2 + ao3, vec4<f32>(1.0));\n"
++         << "      let sums = vec4<f32>(";
++    for (uint32_t c = 0; c < kBlockCols; c++) {
++      if (c) body << ",\n        ";
++      for (uint32_t j = 0; j < 4; j++) {
++        if (j) body << " + ";
++        body << "dot(vec4<f32>(unpack4xU8(q" << c << "[" << j << "] & 0x0F0F0F0Fu)), ae" << j << ") + dot(vec4<f32>(unpack4xU8((q" << c << "["
++             << j << "] >> 4u) & 0x0F0F0F0Fu)), ao" << j << ")";
++      }
++    }
++    body << ");\n"
++         << "      acc" << r << " += (sums - zv * sa) * sv;\n"
++         << "    }\n";
++  }
++  body << "  }\n";
++  for (uint32_t r = 0; r < kBlockRows; r++) body << "  if (rows > " << r << "u) { store_row(" << r << "u, group, lane, acc" << r << "); }\n";
++  body << "  workgroupBarrier();\n"
++          "  reduce_phase(batch, row0, rows, n_base, local_idx);\n";
++  return Status::OK();
++}
++
++// Runs MatMulNBitsBlockProgram when it applies; returns false (and runs nothing) otherwise.
++static bool TryApplyMatMulNBitsBlock(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* zero_points,
++                                     const Tensor* bias, int64_t K_op, int64_t N_op, int64_t block_size, int64_t nbits,
++                                     onnxruntime::webgpu::ComputeContext& context, Tensor* y, Status& status) {
++  const auto f32 = ONNX_NAMESPACE::TensorProto_DataType_FLOAT;
++  if (nbits != 4 || block_size != 32 || K_op % 32 != 0 || a->GetElementType() != f32 || y->GetElementType() != f32 ||
++      scales->GetElementType() != f32 || (bias != nullptr && bias->GetElementType() != f32)) {
++    return false;
++  }
++  TensorShape b_shape({N_op, K_op});
++  MatMulComputeHelper helper;
++  if (!helper.Compute(a->Shape(), b_shape, false, true).IsOK()) return false;
++  const uint32_t M = onnxruntime::narrow<uint32_t>(helper.M());
++  const uint32_t N = onnxruntime::narrow<uint32_t>(helper.N());
++  const uint32_t K = onnxruntime::narrow<uint32_t>(helper.K());
++  if (M < 1 || M > 16) return false;
++  const uint32_t batch_count = onnxruntime::narrow<uint32_t>(helper.OutputOffsets().size());
++  const uint32_t blocks = K / 32;
++  const uint32_t zero_blocks_per_col = (blocks + 1) / 2 * 2;
++  const uint32_t num_M_tile = (M + kBlockRows - 1) / kBlockRows;
++  const uint32_t rows_per_tile = (M + num_M_tile - 1) / num_M_tile;
++  const uint32_t num_N_tile = (N + kBlockCols * kBlockGroups - 1) / (kBlockCols * kBlockGroups);
++  const bool has_zero_points = zero_points != nullptr;
++  MatMulNBitsBlockProgram program{has_zero_points, bias != nullptr};
++  program.AddInputs({{a, ProgramTensorMetadataDependency::TypeAndRank, 4},
++                     {b, ProgramTensorMetadataDependency::TypeAndRank, 16},
++                     {scales, ProgramTensorMetadataDependency::TypeAndRank}});
++  if (has_zero_points) {
++    program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
++  }
++  if (bias != nullptr) {
++    program.AddInput({bias, ProgramTensorMetadataDependency::None});
++  }
++  program.AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank})
++      .SetWorkgroupSize(kBlockLanes * kBlockGroups)
++      .SetDispatchGroupSize(num_N_tile * num_M_tile * batch_count)
++      .CacheHint(has_zero_points, bias != nullptr)
++      .AddUniformVariables({{M}, {N}, {K / 4}, {blocks}, {zero_blocks_per_col}, {num_N_tile}, {num_M_tile}, {rows_per_tile}, {batch_count}})
++      .SetOwnSubmit(static_cast<uint64_t>(batch_count) * M * N * K >= onnxruntime::webgpu::OwnSubmitMatMulWork());
++  status = context.RunProgram(program);
++  return true;
++}
++
  Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context) const {
    const Tensor* a = context.Input(0);
    const Tensor* b = context.Input(1);
-@@ -222,9 +255,104 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -137,6 +312,12 @@ Status MatMulNBits::ComputeInternal(onnxruntime::webgpu::ComputeContext& context
+     return Status::OK();
+   }
+ 
++  if (block_program_) {
++    Status status;
++    if (TryApplyMatMulNBitsBlock(a, b, scales, zero_points, bias, K_, N_, block_size_, bits_, context, y, status)) {
++      return status;
++    }
++  }
+   return ApplyMatMulNBits(a, b, scales, zero_points, bias, K_, N_, block_size_, accuracy_level_, bits_, context, y, 0);
+ }
+ 
+@@ -222,9 +403,104 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    const uint32_t zp_elements_per_byte = 8 / static_cast<uint32_t>(nbits);
    uint32_t zero_blocks_per_col = (n_blocks_per_col + zp_elements_per_byte - 1) / zp_elements_per_byte * zp_elements_per_byte;
  
@@ -2840,7 +3164,7 @@ index 45baa67..08b1b37 100644
                                          accuracy_level,
                                          block_size,
                                          batch_count,
-@@ -240,14 +368,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -240,14 +516,14 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
  
    // On FP32 only GPUs and Qualcomm GPUs, integer math is faster than FP32 therefore always use DP4A independent of length of M.
    // DP4A Q2 path now supports custom zero points via a 1024-entry LUT (4 zero-point sections × 256 byte values).
@@ -2858,7 +3182,7 @@ index 45baa67..08b1b37 100644
                                                                   K,
                                                                   block_size,
                                                                   nbits,
-@@ -318,6 +446,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -318,6 +594,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                   {num_M_tile},
                                   {weight_index}});
      program.CacheHint(nbits, has_zero_points, has_bias, has_weight_idx, has_weight_idx_indirect, subgroup_min_size);
@@ -2866,7 +3190,7 @@ index 45baa67..08b1b37 100644
  
      return context.RunProgram(program);
    }
-@@ -363,6 +492,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
+@@ -363,6 +640,7 @@ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
    if (has_weight_idx_indirect) {
      program.AddInput({weight_index_indirect, ProgramTensorMetadataDependency::None});
    }
@@ -2875,10 +3199,10 @@ index 45baa67..08b1b37 100644
  }
  
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
-index bf56d4f..ef71563 100644
+index bf56d4f..d224de3 100644
 --- a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
 +++ b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits.h
-@@ -71,6 +71,48 @@ class MatMulNBitsProgram final : public Program<MatMulNBitsProgram> {
+@@ -71,9 +71,81 @@ class MatMulNBitsProgram final : public Program<MatMulNBitsProgram> {
    bool broadcast_a_row_;
  };
  
@@ -2924,9 +3248,50 @@ index bf56d4f..ef71563 100644
 +  bool has_bias_;
 +};
 +
++// ORT fork (ovis): 4-bit, block 32, float32 MatMulNBits for 1 <= M <= 16, opt-in per session
++// ("webgpu.matmulnbits_block" = "1"). A lane takes one whole 32-value block per step: one 16-byte
++// load per column, its scale and zero point once, and per row
++//   (sum_k q_k a_k - zero * sum_k a_k) * scale
++// added to the row's accumulator; lanes are summed in workgroup memory in lane order. One
++// workgroup: 8 lanes x 8 column groups x 4 columns, tiles of up to 4 rows (each row its own inlined
++// copy of the same code, so a row's bits do not depend on M).
++class MatMulNBitsBlockProgram final : public Program<MatMulNBitsBlockProgram> {
++ public:
++  MatMulNBitsBlockProgram(bool has_zero_points, bool has_bias)
++      : Program{"MatMulNBitsBlock"}, has_zero_points_(has_zero_points), has_bias_(has_bias) {}
++  Status GenerateShaderCode(ShaderHelper& sh) const override;
++  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
++      {"M", ProgramUniformVariableDataType::Uint32},
++      {"N", ProgramUniformVariableDataType::Uint32},
++      {"K_of_a", ProgramUniformVariableDataType::Uint32},
++      {"blocks_per_col", ProgramUniformVariableDataType::Uint32},
++      {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32},
++      {"num_N_tile", ProgramUniformVariableDataType::Uint32},
++      {"num_M_tile", ProgramUniformVariableDataType::Uint32},
++      {"rows_per_tile", ProgramUniformVariableDataType::Uint32},
++      {"batch_count", ProgramUniformVariableDataType::Uint32});
++
++ private:
++  bool has_zero_points_;
++  bool has_bias_;
++};
++
  class MatMulNBits final : public WebGpuKernel {
   public:
    MatMulNBits(const OpKernelInfo& info) : WebGpuKernel(info) {
++    // ORT fork (ovis): session opt-in for MatMulNBitsBlockProgram.
++    block_program_ = info.GetConfigOptions().GetConfigOrDefault("webgpu.matmulnbits_block", "0") == "1";
+     K_ = info.GetAttr<int64_t>("K");
+     N_ = info.GetAttr<int64_t>("N");
+     block_size_ = info.GetAttr<int64_t>("block_size");
+@@ -91,6 +163,7 @@ class MatMulNBits final : public WebGpuKernel {
+   int64_t block_size_;
+   int64_t accuracy_level_;
+   int64_t bits_;
++  bool block_program_ = false;
+ };
+ 
+ Status ApplyMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales, const Tensor* zero_points, const Tensor* bias,
 diff --git a/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template b/onnxruntime/contrib_ops/webgpu/quantization/matmul_nbits_batched.wgsl.template
 new file mode 100644
 index 0000000..de60fb0

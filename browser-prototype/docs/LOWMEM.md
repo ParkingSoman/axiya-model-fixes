@@ -935,3 +935,28 @@ Intel gen-9 HP, OvisOCR2 1 MP page:
 
 Sources: `~/BlinkFix-models/ocr-probes/results/` (`hp-qv-pinned-prof.json`, `hp-qv-tiled-v2.json`, `hp-prefill-pinned.json`, `hp-prefill-ovis1.json`, `hp-la-test.json`), `~/BlinkFix-models/ocr-probes/README.md` section 11.
 Known latent bug (default FlashAttention, not new): a nonzero scalar f16 attention bias is read wrong. No model in the app hits it. The tiled program reads it right.
+
+## ovis-speed2 (2026-10-01): two opt-in decode programs for the OvisOCR2 decoder and drafter
+
+Pinned dist: `ort-fork-dist-ovis2` (fork branch `ovis-speed2` on `ovis-speed`, commits 5854696 and 7f33d0f; `BUILD-NOTE.txt` in the dist).
+`reference/onnxruntime-webgpu.patch` is the dist's `SOURCE.patch` (v1.30.0..ovis-speed2).
+
+| Session config entry | Program | What it does |
+|---|---|---|
+| `webgpu.matmulnbits_block=1` | `MatMulNBitsBlock` | q4, block 32, f32 MatMulNBits for 1-16 rows. One thread takes one whole 32-value block per step. |
+| `webgpu.linear_attention_decode=1` | `LinearAttentionDecode` | LinearAttention passes of 1-16 tokens run as a gated-delta token loop. |
+
+Both are off unless the session sets the entry. Default programs are unchanged, so the Gemma path keeps its bits. Gates on the Apple M5 (JSPI): `lowmem-batchinv.html?model=e4b` 528/528, 12B 92/92 (`~/BlinkFix-models/ort-fork-dist-ovis2/gates/`).
+
+The app turns both on for the OvisOCR2 decoder and drafter sessions only (not the image reader, not the embedder). The switch is the lock's `runtime.decoderKernels: ['matmulnbits_block', 'linear_attention_decode']`; `decoderSessionExtra` in `src/ovis-ocr/decode.js` maps the names to the entries. Same on every GPU.
+
+Intel gen-9 HP, OvisOCR2 real engine (1 MP, q4), token ids identical to the ovis build:
+
+| Part | ovis | ovis-speed2 |
+|---|---|---|
+| q4 matmuls per decode step | 66 ms | 41 ms (output head 8.1 -> 15.2 GB/s) |
+| K=0 decode step | 112 ms (8.9 tok/s) | 79 ms (12.6 tok/s) |
+| K=2 verify pass | 197 ms (12.3 tok/s) | 175 ms (13.7 tok/s) |
+| First token | about 24 s | unchanged |
+
+Sources: `~/BlinkFix-models/ocr-probes/README.md` section 13, `results/hp-engine-before.json`, `results/hp-engine-block-ladec.json`.
