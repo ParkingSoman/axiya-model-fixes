@@ -1,0 +1,9 @@
+base  per_layer_model_projection.weight RMS = 0.034298
+qat   per_layer_model_projection.weight RMS = 0.000639
+rms_norm_eps = 1e-06
+
+[text tokens: 36]
+  mean square before per_layer_projection_norm: base {'p10': 0.00463, 'median': 0.009632, 'p90': 0.025}  qat {'p10': 1.234e-06, 'median': 2.662e-06, 'p90': 5.515e-06}
+  norm gain sqrt(ms/(ms+eps)):                  base {'p10': 0.9999, 'median': 0.9999, 'p90': 1.0}  qat {'p10': 0.7433, 'median': 0.8526, 'p90': 0.9201}
+  |normed| ratio qat / base: {'p10': 0.6023, 'median': 0.7515, 'p90': 0.8759}    qat / qat_x64: {'p10': 0.7433, 'median': 0.8526, 'p90': 0.9201}
+  final per-layer input cosine, qat vs qat_x64: {'p10': 0.9876, 'median': 0.9973, 'p90': 0.9994}

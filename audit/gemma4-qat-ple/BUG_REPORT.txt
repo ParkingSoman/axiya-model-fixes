@@ -1,0 +1,65 @@
+Title: per_layer_model_projection.weight is ~64x too small in the QAT checkpoint -> per-layer branch is cut by rms_norm_eps (0.24x on image tokens, 0.64x on text tokens) in transformers itself
+
+Checkpoint: google/gemma-4-E4B-it-qat-q4_0-unquantized, revision 476025a01dbf99361c062bbeca3d6a76bb4c4566
+Compared with: google/gemma-4-E4B-it, revision ee0ef6023621cff504d758262d4e04895a5af4a2
+Code: transformers 5.17.0 (the Gemma 4 modeling file on main, 2026-09-22, has the same per-layer code)
+
+WHAT IS WRONG
+Tensor: model.language_model.per_layer_model_projection.weight  [10752, 2560]
+  RMS in the base checkpoint: 0.02476
+  RMS in the QAT checkpoint:  0.000384  (0.0155x base; cosine to base 0.997)
+The same tensor in E2B QAT is also small: 0.000639 vs 0.03430 (0.0186x). With the attached repro
+(--size E2B, 36 text tokens) the E2B QAT norm gain is 0.74 / 0.85 / 0.92 (p10 / median / p90). E2B is hit
+less than E4B, but the cut is still there. E2B image tokens were not measured.
+No other tensor changed by more than about 1.35x. per_layer_projection_norm.weight changed 0.976x.
+rms_norm_eps is 1e-6 in both configs. No config key compensates.
+
+WHERE IT BREAKS (transformers, Gemma4TextModel.project_per_layer_inputs)
+  p = per_layer_model_projection(inputs_embeds) * hidden_size**-0.5      # 1/sqrt(2560)
+  p = per_layer_projection_norm(p)     # Gemma4RMSNorm: p * (mean(p^2) + eps)^-0.5 * weight, in fp32, eps = 1e-6
+  out = (p + per_layer_token_embedding) * 2**-0.5
+With the QAT weight, mean(p^2) falls below eps. The RMSNorm then does not normalize; it scales the branch by
+sqrt(ms / (ms + eps)).
+
+NUMBERS (transformers code on CPU, fp32; bf16 gives the same values to 3 digits)
+Page image (1654x2339 scan of a math paper), Gemma4ImageProcessor max_soft_tokens=1120 -> 1092 image tokens,
+through the real vision tower and each checkpoint's own embed_vision. 60 prompt text tokens.
+
+                                  mean(p^2) before norm (median)   norm gain, QAT (p10 / median / p90)
+  image tokens  base              3.3e-4                          -
+  image tokens  QAT               6.0e-8   (below eps in 100% of token-layers)   0.195 / 0.239 / 0.304
+  text tokens   base              3.3e-3                          -
+  text tokens   QAT               6.8e-7   (below eps in 70% of token-layers)    0.51 / 0.64 / 0.82
+  base checkpoint gain: 0.998 (image), 1.000 (text)
+
+Post-norm magnitude, QAT / base (median): image 0.233, text 0.547. Direction is kept (cosine QAT vs base
+after the norm: 0.983). The gain varies by token and layer (0.21 to 0.34 per layer on image tokens), so this
+is not a constant rescale that later layers can absorb. Final per-layer input, QAT vs QAT with the weight
+x64: cosine 0.86 (image), 0.98 (text).
+
+EFFECT ON OUTPUT (llama.cpp b11211, which uses the same formula; the official QAT Q4_0 GGUF carries the same
+tensor bit-exact in F16)
+Page transcription test, 8 draws per row, sampling T=1 top_k 64 top_p 0.95 min_p 0.05:
+  QAT Q4_0 as released                          formula anchors 14/96, text anchors 217/304
+  same file, only this tensor x64               formula anchors 54/96, text anchors 286/304
+  same file, weights unchanged, eps 1e-12       28/48 on 4 draws (x64 on the same seeds: 28/48);
+                                                2 of 4 draws byte-identical to the x64 draws
+  same file, this tensor replaced by base       53/96
+  base checkpoint (MLX 8-bit)                   28/48 on 4 draws
+The eps-1e-12 run changes only eps, so the eps term is the cause, not a precision effect.
+
+REPRO
+repro_ple_eps.py (attached) reads only the needed tensors from both repos with HTTP range reads and calls
+transformers' own Gemma4TextModel.project_per_layer_inputs / Gemma4RMSNorm / Gemma4VisionModel.
+  python repro_ple_eps.py                    # text tokens, ~1 min
+  python repro_ple_eps.py --image page.png   # adds image tokens through the vision tower
+  python repro_ple_eps.py --size E2B
+
+SUGGESTED FIX
+Re-export the QAT checkpoint with per_layer_model_projection.weight at the trained scale. If the released values
+are correct up to a scale, multiplying the tensor by 64 restores base-level output in our test (x64 is exact in
+bf16/f16). Until then, users can multiply that tensor by 64, or lower rms_norm_eps for per_layer_projection_norm.
+Please also check E2B QAT (same symptom) and the other QAT exports for the same tensor.
+
+WHY THE WEIGHT IS SMALL: not known to us. The ratio 0.0155 is close to 2560**-0.5 = 0.0198 times the 0.72-0.86
+shrink seen on other QAT weights, which would fit a folded runtime scale. We have not confirmed this.

@@ -1,0 +1,15 @@
+base  per_layer_model_projection.weight RMS = 0.024761
+qat   per_layer_model_projection.weight RMS = 0.000384
+rms_norm_eps = 1e-06
+
+[text tokens: 36]
+  mean square before per_layer_projection_norm: base {'p10': 0.001739, 'median': 0.003337, 'p90': 0.01073}  qat {'p10': 3.501e-07, 'median': 7.272e-07, 'p90': 1.916e-06}
+  norm gain sqrt(ms/(ms+eps)):                  base {'p10': 0.9997, 'median': 0.9999, 'p90': 1.0}  qat {'p10': 0.5092, 'median': 0.6489, 'p90': 0.8106}
+  |normed| ratio qat / base: {'p10': 0.3842, 'median': 0.548, 'p90': 0.7829}    qat / qat_x64: {'p10': 0.5094, 'median': 0.649, 'p90': 0.8106}
+  final per-layer input cosine, qat vs qat_x64: {'p10': 0.9468, 'median': 0.9818, 'p90': 0.9965}
+
+[image tokens: 1092]
+  mean square before per_layer_projection_norm: base {'p10': 0.0002095, 'median': 0.0003339, 'p90': 0.0006707}  qat {'p10': 3.97e-08, 'median': 6.036e-08, 'p90': 1.017e-07}
+  norm gain sqrt(ms/(ms+eps)):                  base {'p10': 0.9976, 'median': 0.9985, 'p90': 0.9993}  qat {'p10': 0.1954, 'median': 0.2386, 'p90': 0.3039}
+  |normed| ratio qat / base: {'p10': 0.1842, 'median': 0.2332, 'p90': 0.3087}    qat / qat_x64: {'p10': 0.196, 'median': 0.2391, 'p90': 0.3043}
+  final per-layer input cosine, qat vs qat_x64: {'p10': 0.4514, 'median': 0.8608, 'p90': 0.9211}

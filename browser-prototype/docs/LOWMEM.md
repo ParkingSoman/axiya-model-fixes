@@ -16,7 +16,7 @@ are guesses. No Windows machine has run this build.
 ## Try it locally
 
 ```
-cd /Users/shonusengupta/BlinkFix/.claude/worktrees/lowmem/browser-prototype
+cd browser-prototype
 npm start
 ```
 
@@ -76,7 +76,7 @@ fixed fork build (`gate-binv.json`).
 
 | Item | Value |
 |---|---|
-| Model package | `/Users/shonusengupta/BlinkFix-models/gemma-12b-q4/` (`decoder.onnx` `a6c6f4ea…`, the fix2 trim graph) |
+| Model package | `BlinkFix-models/gemma-12b-q4/` (local model folder) (`decoder.onnx` `a6c6f4ea…`, the fix2 trim graph) |
 | Fork dist | `ort-fork-dist-inv` (before: `binv`, `pm-a`), its 4 served files in `reference/ort-fork-dist/` (in git since 2026-09-27); pinned by `reference/ort-fork-dist.json` |
 | Browser profile (model cached) | `agent-a1a20012219348d7d/browser-prototype/evidence/gemma12b-profile` |
 | Degraded scans | `evidence/lowmem/scans/` (made by `make_scans.py` there): openstax and mathfuncs page 1, 150 DPI, grey, 1.3° and −1.8° skew, blur, noise, specks, JPEG q45, image-only PDF |
@@ -247,7 +247,7 @@ Gate pages, 5,789 positions (`evidence/lowmem/a2/cert-gate.json`), `asym`:
 - In practice, the 4-bit head put the true 8-bit argmax in its top 16 at every
   one of the 5,789 + 192 positions. A head that re-checks only the top 16
   would match here, but nothing proves it for every page. That is a
-  non-exact change, so it is the user's decision (saving about 0.55 GB of GPU
+  non-exact change, so it is my decision (saving about 0.55 GB of GPU
   memory).
 
 ## C5: an AI edit pauses a page instead of restarting it
@@ -284,7 +284,7 @@ image tokens fixed at the budget, 4 pages at a time), `scripts/lowmem-a0-llama.m
 Scored with the pinned olmOCR scorer (`f7cfe4c`), `tools/lowmem/a0_score.py`.
 Files: `evidence/lowmem/a0/llama-budget{560,1120}.json`, `score-summary.json`.
 
-Subset, fixed before any result (the user's 15-minute rule cut it twice): the
+Subset, fixed before any result (my 15-minute rule cut it twice): the
 first 2 PDFs of each bench-v2 category (12) plus openstax, 80 olmOCR checks.
 Each page is capped at 1,500 output tokens at both budgets.
 
@@ -730,10 +730,9 @@ Longest single dispatch on the M5: E2B vision flash attention, about 137 ms
 
 ## Windows GPU: hang, lag and garbage on an Intel gen-9 laptop (2026-09-28)
 
-Plan: `~/.claude/plans/so-i-tried-concurrent-wind.md`. Test machine: the user's
-HP laptop (Intel gen-9 integrated GPU, 16 GB, Chrome 154, D3D12), driven from
-the Mac with Claude in Chrome over a Cloudflare tunnel (memory
-`windows-hp-harness`). Evidence: `evidence/windows-hp/`, `evidence/f16-read/`.
+Plan: `~/.claude/plans/so-i-tried-concurrent-wind.md`. Test machine: my
+HP laptop (Intel gen-9 integrated GPU, 16 GB, Chrome 154, D3D12), driven remotely from
+the Mac. Evidence: `evidence/windows-hp/`, `evidence/f16-read/`.
 
 ### Tools
 
