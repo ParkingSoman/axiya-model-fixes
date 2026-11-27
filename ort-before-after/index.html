@@ -45,6 +45,10 @@
   ul { margin: 4px 0 10px; padding-left: 20px; }
   iframe { display: none; }
   .nowrap { white-space: nowrap; }
+  .sim { display:flex; flex-wrap:wrap; gap:12px; }
+  .sim figure { margin:0; }
+  .sim canvas { width:256px; height:96px; image-rendering:pixelated; border:1px solid var(--line); background:#fff; }
+  .sim figcaption { font-size:13px; margin-top:4px; }
 </style>
 </head>
 <body>
@@ -52,9 +56,25 @@
   <h1>Intel f16 bug in Axiya's ONNX Runtime Web build: before and after the fix</h1>
   <p><strong>The bug:</strong> on an Intel gen-9 laptop GPU (Windows, Chrome 154, D3D12, September 2026), a GPU program that read one 16-bit number (f16) from memory got 0 for every odd-numbered element, so models gave wrong output.</p>
   <p><strong>What this page does:</strong> it runs one tiny model on your GPU twice, once with the last build of Axiya's ONNX Runtime Web (WebGPU) from before the fix, and once with the first build after it. It then compares each output with values computed in advance on a CPU.</p>
-  <p><strong>Your result depends on your GPU, its driver and your browser.</strong> The bug was seen on one Intel gen-9 laptop in Chrome 154. On the same laptop in Chrome 158 (November 2026), a 16-bit read probe no longer fails, so there both builds may now be correct.</p>
+  <p><strong>Where the fault was:</strong> in the laptop's older Windows and Intel graphics driver. In October 2026 the same laptop moved to Windows 11 build 26300 and Intel driver 31.0.101.2140. On that setup, the same Chrome 154 runs the old build correctly. So on most computers today both builds below are correct; the fixed build protects computers that still run the older driver.</p>
+  <p>Below: what the model actually wrote on the laptop in September (recorded), a simulation of the fault, and a live run of both builds on your GPU.</p>
 
-  <h2>This computer</h2>
+  <h2>Recorded on the laptop, September 28, 2026</h2>
+  <p class="muted">The model read the same scanned page on the laptop (Intel gen-9, Chrome 154) with each build, and on a Mac for reference. First words of its answer:</p>
+  <table>
+    <tr><th>Mac (reference)</th><td>for the year ended 30 June</td></tr>
+    <tr><th>Laptop, build before the fix</th><td class="bad"> revised بواسط𐰃beitenっぽい銨 предлагают proponents</td></tr>
+    <tr><th>Laptop, fixed build</th><td class="ok"># the year ended 30 June</td></tr>
+  </table>
+  <p class="muted">Top answers that matched the Mac over 8 positions: 0 of 8 before the fix, 8 of 8 after. Records: <a href="records/laptop-before-fix-2026-09-28.json">before</a>, <a href="records/laptop-after-fix-2026-09-28.json">after</a> (see <code>positions.top1Equal</code> and <code>text</code>; the <code>verdicts</code> line in these files is a page label and is not a result).</p>
+
+  <h2>Simulation: what the fault does to what each build reads</h2>
+  <p class="muted">This applies the recorded fault (when a program reads one 16-bit value at a time, every odd-numbered value comes back as 0) to a small image stored as 16-bit values. The old build reads values one at a time, so it is hit. The fixed build reads 32-bit words and splits them, so it is not. This part is a simulation, run in JavaScript, not on your GPU.</p>
+  <div class="sim"><figure><canvas id="sim-true" width="256" height="96"></canvas><figcaption>The stored image</figcaption></figure><figure><canvas id="sim-before" width="256" height="96"></canvas><figcaption class="bad">Old build on the old driver</figcaption></figure><figure><canvas id="sim-after" width="256" height="96"></canvas><figcaption class="ok">Fixed build on the old driver</figcaption></figure></div>
+
+  <h2>Live: both builds on your GPU</h2>
+
+  <h3>This computer</h3>
   <table id="env">
     <tr><th>Browser</th><td id="env-browser">checking...</td></tr>
     <tr><th>GPU vendor</th><td id="env-vendor">checking...</td></tr>
@@ -203,6 +223,24 @@ $('verdict').className = `verdict ${cls}`;
 $('verdict').textContent = text;
 window.ortBeforeAfter = { browser, env, results, verdict: text };
 document.documentElement.dataset.done = '1';
+</script>
+
+<script>
+(function(){
+  const W=128,H=48;
+  const src=document.createElement('canvas'); src.width=W; src.height=H;
+  const g=src.getContext('2d'); g.fillStyle='#fff'; g.fillRect(0,0,W,H); g.fillStyle='#000';
+  g.font='bold 15px Georgia, serif'; g.fillText('x² + y² = r²',6,20); g.font='13px Georgia, serif'; g.fillText('30 June 2026',8,40);
+  const px=g.getImageData(0,0,W,H).data;
+  const vals=new Float32Array(W*H); for(let i=0;i<W*H;i++) vals[i]=1-px[i*4]/255;   // ink amount, stored as 16-bit values
+  function draw(id,v){ const c=document.getElementById(id), x=c.getContext('2d'), im=x.createImageData(W,H);
+    for(let i=0;i<W*H;i++){ const s=Math.round(255*(1-v[i])); im.data[i*4]=s; im.data[i*4+1]=s; im.data[i*4+2]=s; im.data[i*4+3]=255; }
+    const t=document.createElement('canvas'); t.width=W; t.height=H; t.getContext('2d').putImageData(im,0,0);
+    x.imageSmoothingEnabled=false; x.drawImage(t,0,0,c.width,c.height); }
+  const before=vals.map((v,i)=> i%2===1 ? 0 : v);   // fault: odd-numbered 16-bit values read one at a time come back as 0
+  const after=Float32Array.from(vals);              // fix: read 32-bit words, split into two 16-bit values: no loss
+  draw('sim-true',vals); draw('sim-before',before); draw('sim-after',after);
+})();
 </script>
 </body>
 </html>
