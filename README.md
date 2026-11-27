@@ -29,6 +29,7 @@ Effect on one scanned math-paper page (llama.cpp, the released QAT Q4_0 file, 8 
 A control run changes only eps (to 1e-12) and matches the x64 fix (28/48 each, on 4 draws), so eps is the cause, not precision. Why the weight is small is not known. The report's guess is a folded runtime scale.
 
 - Full report and a repro script that reads Google's own checkpoints: [`audit/gemma4-qat-ple/`](audit/gemma4-qat-ple/)
+- Reported to Google on the checkpoint's Hugging Face page (2026-11-27): https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-unquantized/discussions/7
 - Patch script: `browser-prototype/scripts/e4b-pleproj-patch.py` (commit `e624af8`, 2026-09-27)
 - My published models carry the fix. Their cards list the scale: [E4B](https://huggingface.co/parkingsoman/gemma-4-e4b-it-onnx-webgpu) ("x64.0"), [E2B](https://huggingface.co/parkingsoman/gemma-4-e2b-it-onnx-webgpu) ("x53.65")
 
