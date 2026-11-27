@@ -10,8 +10,6 @@ Axiya (https://axiya.io) runs vision-language models locally in the browser on W
 This repo holds the records of the model and GPU bugs I found and fixed to make that work.
 It was cut out of Axiya's private repo (code name BlinkFix), with the original commit history. Git dates are set by the author; the Hugging Face model cards below, created 2026-09-28, give an independent date for fix 1.
 
-Credit: I directed the work, chose what to test and checked the results. Claude (Opus) coding sessions wrote much of the code and the commit messages. That is why 80 of the commits carry a Co-Authored-By line.
-
 ## 1. Google's Gemma 4 QAT checkpoints: one weight is about 64 times smaller than in the base model
 
 In Google's quantization-aware-trained (QAT) Gemma 4 E4B checkpoint, `per_layer_model_projection.weight` has RMS 0.000384, against 0.02476 in the base model.
