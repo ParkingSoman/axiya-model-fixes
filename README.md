@@ -29,6 +29,8 @@ Effect on one scanned math-paper page (llama.cpp, the released QAT Q4_0 file, 8 
 A control run changes only eps (to 1e-12) and matches the x64 fix (28/48 each, on 4 draws), so eps is the cause, not precision. Why the weight is small is not known. The report's guess is a folded runtime scale.
 
 - Full report and a repro script that reads Google's own checkpoints: [`audit/gemma4-qat-ple/`](audit/gemma4-qat-ple/)
+- [Open in Colab](https://colab.research.google.com/github/ParkingSoman/axiya-model-fixes/blob/main/audit/gemma4-qat-ple/rerun.ipynb)
+- Rerun on any computer in about 1 minute (measured: 37 s for E4B, 34 s for E2B on a Mac CPU, after the packages are installed): `pip install torch "transformers>=5.5" huggingface_hub safetensors` then `python audit/gemma4-qat-ple/repro_ple_eps.py`
 - Reported to Google on the checkpoint's Hugging Face page (2026-11-27): https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-unquantized/discussions/7
 - Patch script: `browser-prototype/scripts/e4b-pleproj-patch.py` (commit `e624af8`, 2026-09-27)
 - My published models carry the fix. Their cards list the scale: [E4B](https://huggingface.co/parkingsoman/gemma-4-e4b-it-onnx-webgpu) ("x64.0"), [E2B](https://huggingface.co/parkingsoman/gemma-4-e2b-it-onnx-webgpu) ("x53.65")
@@ -47,6 +49,7 @@ The fix makes every GPU step read the full 32-bit word, which holds two numbers,
 | Mac: vision taps still bit-identical | | 141/141 |
 | Mac: cost (decoder GPU time) | | +2.3% |
 
+- Run the probe in Chrome: https://parkingsoman.github.io/axiya-model-fixes/browser-prototype/tools/gpu-debug/f16-store-test.html . It needs a GPU with WebGPU `shader-f16`. It prints JSON with `wrongOdd` and `wrongEven` counts for each of 19 kernels. On an unaffected GPU every count is 0. On the affected Intel gen-9 GPUs, the odd-element reads report wrong values.
 - Fix: commit `885da74` (2026-09-28), in `browser-prototype/reference/onnxruntime-webgpu.patch`. The record is in `browser-prototype/docs/LOWMEM.md`, section "Garbage text: odd f16 elements read as 0". The raw HP captures are not in this repo.
 - The build refuses a fork patch without it: `browser-prototype/scripts/build-ort-fork.sh`
 

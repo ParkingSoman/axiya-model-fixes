@@ -5,7 +5,7 @@ than in google/gemma-4-E4B-it. With transformers' own Gemma4 code, the per-layer
 `per_layer_projection_norm` then has a mean square BELOW rms_norm_eps (1e-6), so the RMSNorm no longer
 normalizes: it shrinks the branch to ~0.24x (image tokens) / ~0.64x (text tokens) of its intended size.
 
-Needs: torch, transformers>=5.5 (Gemma4), huggingface_hub, safetensors. Access to both gated repos (HF token).
+Needs: torch, transformers>=5.5 (Gemma4), huggingface_hub, safetensors. No HF token needed: the base and QAT repos are public (gated=False).
 Downloads only the few tensors it needs (HTTP range reads, ~60 MB for text mode; +~400 MB with --image).
 CPU only, < 3 GB RAM.
 
