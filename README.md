@@ -51,7 +51,7 @@ The fix makes every GPU step read the full 32-bit word, which holds two numbers,
 | Mac: vision taps still bit-identical | | 141/141 |
 | Mac: cost (decoder GPU time) | | +2.3% |
 
-- Run the probe in Chrome: https://parkingsoman.github.io/axiya-model-fixes/browser-prototype/tools/gpu-debug/f16-store-test.html . It needs a GPU with WebGPU `shader-f16`, and prints `wrongOdd` / `wrongEven` counts for each of 19 kernels. In September 2026 (Chrome 154) the single-element 16-bit reads failed on my HP laptop. On the same laptop in Chrome 158 (2026-11-27), and on an Apple M5 Mac, all 19 kernels report 0 wrong, so Chrome or Intel's driver has since fixed it. The September failure is from my own record; the fix in my runtime stays for older versions.
+- Run the probe in Chrome: https://parkingsoman.github.io/axiya-model-fixes/browser-prototype/tools/gpu-debug/f16-store-test.html . It needs a GPU with WebGPU `shader-f16`, and prints `wrongOdd` / `wrongEven` counts for each of 19 kernels. In September 2026 (Chrome 154) the single-element 16-bit reads failed on my HP laptop. On the same laptop in Chrome 158 (2026-11-27), and on an Apple M5 Mac, all 19 kernels report 0 wrong, I found no public record of what changed; it could be Chrome, Intel's driver or a Windows update. The September failure is from my own record; Axiya's fixed build works either way.
 - Fix: commit `885da74` (2026-09-28), in `browser-prototype/reference/onnxruntime-webgpu.patch`. The record is in `browser-prototype/docs/LOWMEM.md`, section "Garbage text: odd f16 elements read as 0". The raw HP captures are not in this repo.
 - The build refuses a fork patch without it: `browser-prototype/scripts/build-ort-fork.sh`
 
