@@ -1,8 +1,10 @@
 # Axiya model fixes
 
 **In short:** Axiya runs AI models inside the web browser, on the user's own computer. That surfaced two bugs, which I found and fixed:
-1. Google's compact Gemma 4 models have one set of internal numbers about 64 times too small, which makes them read pages worse. Scaling those numbers up took one test page from 14 to 54 formulas read correctly, out of 96 (12 formulas, 8 tries each).
-2. Older Intel graphics chips read every second 16-bit number as 0, so the model wrote random words. Reading numbers in pairs fixed it: the laptop's output now matches a Mac's (similarity 0.999996, where 1 = identical).
+1. Google's compact Gemma 4 models have one set of internal numbers about 64 times smaller than in Google's regular versions, which makes them read pages worse. Scaling those numbers up took one test page from 14 to 54 formulas read correctly, out of 96 (12 formulas, 8 tries each).
+2. On my older HP laptop, the Intel gen-9 graphics (chip or driver) read every second 16-bit number as 0, so the model wrote random words. Reading numbers in pairs fixed it: the laptop's output now matches a Mac's (similarity 0.999996, where 1 = identical).
+
+The weight sizes can be rerun by anyone (see the Colab link below). The page scores (14/96, 217/304) and the Intel numbers are my own measurements; the test page, its scorer and the raw laptop captures are not public.
 
 The rest of this page gives the details.
 
@@ -35,7 +37,7 @@ A control run changes only eps (to 1e-12) and matches the x64 fix (28/48 each, o
 - Patch script: `browser-prototype/scripts/e4b-pleproj-patch.py` (commit `e624af8`, 2026-09-27)
 - My published models carry the fix. Their cards list the scale: [E4B](https://huggingface.co/parkingsoman/gemma-4-e4b-it-onnx-webgpu) ("x64.0"), [E2B](https://huggingface.co/parkingsoman/gemma-4-e2b-it-onnx-webgpu) ("x53.65")
 
-## 2. Intel gen-9 GPUs: every second 16-bit number reads as 0
+## 2. Intel gen-9 GPU on my HP laptop: every second 16-bit number reads as 0
 
 On my older HP laptop (Intel gen-9 integrated GPU, Windows, Chrome, D3D12), the model wrote random words.
 An op-by-op comparison against the Mac (`browser-prototype/tools/gpu-debug/vision_taps.py`, `compare_taps.py`) found the first wrong step: every odd 16-bit value read as 0.
