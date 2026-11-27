@@ -7,7 +7,7 @@ Code: transformers 5.17.0 (the Gemma 4 modeling file on main, 2026-09-22, has th
 WHAT IS WRONG
 Tensor: model.language_model.per_layer_model_projection.weight  [10752, 2560]
   RMS in the base checkpoint: 0.02476
-  RMS in the QAT checkpoint:  0.000384  (0.0155x base; cosine to base 0.997)
+  RMS in the QAT checkpoint:  0.000384  (0.0155x base; cosine to base 0.989)
 The same tensor in E2B QAT is also small: 0.000639 vs 0.03430 (0.0186x). With the attached repro
 (--size E2B, 36 text tokens) the E2B QAT norm gain is 0.74 / 0.85 / 0.92 (p10 / median / p90). E2B is hit
 less than E4B, but the cut is still there. E2B image tokens were not measured.

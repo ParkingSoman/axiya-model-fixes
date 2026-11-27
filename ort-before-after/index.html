@@ -56,17 +56,18 @@
   <h1>Intel f16 bug in Axiya's ONNX Runtime Web build: before and after the fix</h1>
   <p><strong>The bug:</strong> on an Intel gen-9 laptop GPU (Windows, Chrome 154, D3D12, September 2026), a GPU program that read one 16-bit number (f16) from memory got 0 for every odd-numbered element, so models gave wrong output.</p>
   <p><strong>What this page does:</strong> it runs one tiny model on your GPU twice, once with the last build of Axiya's ONNX Runtime Web (WebGPU) from before the fix, and once with the first build after it. It then compares each output with values computed in advance on a CPU.</p>
-  <p><strong>What the bug depended on:</strong> the laptop's older Windows and Intel graphics driver, not the Chrome version. In October 2026 the same laptop moved to Windows 11 build 26300 and Intel driver 31.0.101.2140. On that setup, the same Chrome 154 runs the old build correctly. So on most computers today both builds below are correct; the fixed build protects computers that still run the older driver.</p>
-  <p>Below: what the model actually wrote on the laptop in September (recorded), a simulation of the fault, and a live run of both builds on your GPU.</p>
+  <p><strong>What the bug depended on:</strong> the laptop's older Windows or Intel graphics driver, not the Chrome version. In October 2026 the laptop's Windows was reinstalled (build 26300) and it got a new Intel driver (31.0.101.2140). On November 27, 2026, I ran Google's own Chrome 154 test build (Chrome for Testing 154.0.8037.92) on that setup, and the old build gave correct results. So on most computers today both builds below are correct. The fixed build protects computers that still have the older setup.</p>
+  <p>Below: what the model wrote on the laptop in September (recorded), a simulation of the fault, and a live run of both builds on your GPU.</p>
 
   <h2>Recorded on the laptop, September 28, 2026</h2>
-  <p class="muted">The model read the same scanned page on the laptop (Intel gen-9, Chrome 154) with each build, and on a Mac for reference. First words of its answer:</p>
+  <p class="muted">Axiya's AI model read the same scanned page three times: on an Apple Mac, which does not have the bug (the reference), and on the laptop (Intel gen-9 graphics, Chrome 154) with the old build and with the fix. First words of each answer:</p>
   <table>
     <tr><th>Mac (reference)</th><td>for the year ended 30 June</td></tr>
-    <tr><th>Laptop, build before the fix</th><td class="bad"> revised بواسط𐰃beitenっぽい銨 предлагают proponents</td></tr>
-    <tr><th>Laptop, fixed build</th><td class="ok"># the year ended 30 June</td></tr>
+    <tr><th>Laptop, old build</th><td class="bad"> revised بواسط𐰃beitenっぽい銨 предлагают proponents</td></tr>
+    <tr><th>Laptop, with the fix</th><td class="ok"># the year ended 30 June</td></tr>
   </table>
-  <p class="muted">Top answers that matched the Mac over 8 positions: 0 of 8 before the fix, 8 of 8 after. Records: <a href="records/laptop-before-fix-2026-09-28.json">before</a>, <a href="records/laptop-after-fix-2026-09-28.json">after</a> (see <code>positions.top1Equal</code> and <code>text</code>; the <code>verdicts</code> line in these files is a page label and is not a result).</p>
+  <p class="muted">The model picks each word at random from its top choices, so two correct runs can start differently ("for" or "#"). The fair test is the model's first choice at each of the first 8 words. It matched the Mac's 0 of 8 times with the old build and 8 of 8 times with the fix. How closely the laptop's reading of the image matched the Mac's (1 = identical): 0.45 with the old build, 0.999996 with the fix.</p>
+  <p class="muted">Records: <a href="records/laptop-before-fix-2026-09-28.json">old build</a> (its program file matches the old build on this page), <a href="records/laptop-after-fix-2026-09-28.json">with the fix</a>. The second record was made with a test build of the fix, 21 minutes before I committed it, so its program file is not byte-identical to the fixed build on this page. In each file, the numbers are under <code>text</code>, <code>positions.top1Equal</code> and <code>vision.median</code>. In the old-build file, ignore the line "NEW: matches the Mac". The version of my test page used that afternoon read the wrong field names, so it printed that line whatever the numbers were. I fixed the test page two minutes later, before the second record. The numbers in both files are the real result.</p>
 
   <h2>Simulation: what the fault does to what each build reads</h2>
   <p class="muted">This applies the recorded fault (when a program reads one 16-bit value at a time, every odd-numbered value comes back as 0) to a small image stored as 16-bit values. The old build reads values one at a time, so it is hit. The fixed build reads 32-bit words and splits them, so it is not. This part is a simulation, run in JavaScript, not on your GPU.</p>
