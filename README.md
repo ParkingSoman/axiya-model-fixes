@@ -2,11 +2,11 @@
 
 Axiya (https://axiya.io) runs vision-language models locally in the browser on WebGPU, through a fork of ONNX Runtime Web.
 This repo holds the records of the model and GPU bugs I found and fixed to make that work.
-It was cut out of Axiya's private repo (code name BlinkFix), and the commits keep their original dates and messages.
+It was cut out of Axiya's private repo (code name BlinkFix), with the original commit history. Git dates are set by the author; the Hugging Face model cards below, created 2026-09-28, give an independent date for fix 1.
 
 Credit: I directed the work, chose what to test and checked the results. Claude (Opus) coding sessions wrote much of the code and the commit messages. That is why 80 of the commits carry a Co-Authored-By line.
 
-## 1. Google's Gemma 4 QAT checkpoints: one weight is about 64 times too small
+## 1. Google's Gemma 4 QAT checkpoints: one weight is about 64 times smaller than in the base model
 
 In Google's quantization-aware-trained (QAT) Gemma 4 E4B checkpoint, `per_layer_model_projection.weight` has RMS 0.000384, against 0.02476 in the base model.
 The RMSNorm after it has eps 1e-6 (a small constant added for stability). With the small weight, the signal falls below eps, so the norm shrinks the whole per-layer branch: to about 0.24x on image tokens and 0.64x on text tokens.
@@ -22,7 +22,7 @@ Effect on one scanned math-paper page (llama.cpp, the released QAT Q4_0 file, 8 
 | Same file, only this tensor x64 | **54/96** | **286/304** |
 | Same file, tensor replaced by the base model's | 53/96 | |
 
-A control run changes only eps (to 1e-12) and recovers the same score as x64, so eps is the cause, not precision.
+A control run changes only eps (to 1e-12) and matches the x64 fix (28/48 each, on 4 draws), so eps is the cause, not precision. Why the weight is small is not known. The report's guess is a folded runtime scale.
 
 - Full report and a repro script that reads Google's own checkpoints: [`audit/gemma4-qat-ple/`](audit/gemma4-qat-ple/)
 - Patch script: `browser-prototype/scripts/e4b-pleproj-patch.py` (commit `e624af8`, 2026-09-27)
