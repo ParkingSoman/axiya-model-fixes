@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>ORT runner</title>
+</head>
+<body>
+<script type="module">
+// Runs the two test models with one ONNX Runtime Web build, picked by
+// ?build=before or ?build=after. index.html loads this page in its own
+// iframe for each build, so the two builds never share a module, a global
+// or a GPU device. The result goes back to the parent with postMessage.
+const build = new URLSearchParams(location.search).get('build');
+const post = (msg) => parent.postMessage({ source: 'ort-runner', build, ...msg }, location.origin);
+
+// Keep the WGSL of every shader this build compiles, to show how it reads
+// the float16 inputs.
+const shaders = [];
+if (globalThis.GPUDevice) {
+  const create = GPUDevice.prototype.createShaderModule;
+  GPUDevice.prototype.createShaderModule = function (desc) {
+    shaders.push(String(desc && desc.code || ''));
+    return create.call(this, desc);
+  };
+}
+
+function f16Bits(data) {
+  return new Uint16Array(data.buffer, data.byteOffset, data.length);
+}
+
+function score(gotEqual, sourceOffset) {
+  const r = { total: sourceOffset.length, correct: 0, wrongOdd: 0, wrongEven: 0, wrongZero: 0, odd: 0, even: 0, samples: [] };
+  for (let i = 0; i < sourceOffset.length; i++) {
+    const odd = sourceOffset[i] % 2 === 1;
+    odd ? r.odd++ : r.even++;
+    const { ok, got, want } = gotEqual(i);
+    if (ok) { r.correct++; continue; }
+    odd ? r.wrongOdd++ : r.wrongEven++;
+    if (got === 0) r.wrongZero++;
+    if (r.samples.length < 6) r.samples.push({ i, sourceOffset: sourceOffset[i], got, want });
+  }
+  return r;
+}
+
+function f16ToNumber(bits) {
+  const s = bits & 0x8000 ? -1 : 1, e = (bits >> 10) & 0x1f, m = bits & 0x3ff;
+  if (e === 0) return s * m * 2 ** -24;
+  if (e === 31) return m ? NaN : s * Infinity;
+  return s * (1 + m / 1024) * 2 ** (e - 15);
+}
+
+// What the compiled shaders say about how float16 inputs are read.
+function shaderSummary() {
+  const f16Scalar = shaders.filter((c) => /var<storage,\s*read>\s*\w+\s*:\s*array<f16>/.test(c)).length;
+  const packed = shaders.filter((c) => c.includes('bitcast<vec2<f16>>')).length;
+  return { compiled: shaders.length, f16ScalarInputs: f16Scalar, packedF16Reads: packed };
+}
+
+try {
+  if (!['before', 'after'].includes(build)) throw Error('build must be before or after');
+  if (!navigator.gpu) throw Error('This browser has no WebGPU (navigator.gpu is missing).');
+  const ort = await import(`./${build}/ort.webgpu.min.mjs`);
+  ort.env.wasm.wasmPaths = new URL(`./${build}/`, location.href).href;
+  ort.env.wasm.numThreads = 1; // GitHub Pages sends no COOP/COEP headers, so no SharedArrayBuffer.
+  ort.env.logLevel = 'error';
+  const expected = await (await fetch('expected.json')).json();
+  const options = { executionProviders: ['webgpu'], graphOptimizationLevel: 'disabled' };
+
+  // Gather over the float16 table.
+  const g = expected.gather;
+  const gather = await ort.InferenceSession.create(g.model, options);
+  const gatherShadersFrom = shaders.length;
+  const gOut = (await gather.run({ indices: new ort.Tensor('int64', BigInt64Array.from(g.indices, BigInt), [g.indices.length]) })).out;
+  const gotG = f16Bits(gOut.data);
+  const gatherResult = score((i) => ({ ok: gotG[i] === g.expected_f16_bits[i], got: f16ToNumber(gotG[i]), want: f16ToNumber(g.expected_f16_bits[i]) }), g.source_offset);
+  gatherResult.shaders = shaders.slice(gatherShadersFrom);
+
+  // Cast float16 -> float32, then add 0.
+  const c = expected.cast;
+  const cast = await ort.InferenceSession.create(c.model, options);
+  const castShadersFrom = shaders.length;
+  const cOut = (await cast.run({ x: new ort.Tensor('float16', Uint16Array.from(c.input_f16_bits), [c.input_f16_bits.length]) })).y;
+  const gotC = cOut.data;
+  const castResult = score((i) => ({ ok: Object.is(gotC[i], c.expected_f32[i]), got: gotC[i], want: c.expected_f32[i] }), c.source_offset);
+  castResult.shaders = shaders.slice(castShadersFrom);
+
+  post({ ok: true, ortVersion: ort.env.versions && ort.env.versions.web, gather: gatherResult, cast: castResult, shaderInfo: shaderSummary() });
+} catch (error) {
+  post({ ok: false, error: String(error && error.message || error), shaderInfo: shaderSummary() });
+}
+</script>
+</body>
+</html>

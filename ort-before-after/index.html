@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intel f16 fix: before and after</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d0d7de; --panel: #f6f8fa;
+    --ok: #1a7f37; --bad: #cf222e; --warn: #9a6700; --code: #eff1f3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --panel: #161b22;
+      --ok: #3fb950; --bad: #f85149; --warn: #d29922; --code: #1f242c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.6rem; line-height: 1.25; margin: 0 0 12px; }
+  h2 { font-size: 1.15rem; margin: 28px 0 8px; }
+  h3 { font-size: 1rem; margin: 0 0 8px; }
+  p { margin: 0 0 10px; }
+  code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 0.9em; overflow-wrap: anywhere; }
+  a { color: inherit; }
+  .muted { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .verdict { font-size: 1.15rem; font-weight: 600; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); margin: 16px 0; }
+  .verdict.ok { border-color: var(--ok); }
+  .verdict.bad { border-color: var(--bad); }
+  .verdict.warn { border-color: var(--warn); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 640px) { .cols { grid-template-columns: 1fr; } }
+  .col { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--panel); min-width: 0; }
+  .big { font-size: 1.3rem; font-weight: 700; }
+  .ok { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .warn { color: var(--warn); }
+  .test { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--line); }
+  .test:first-of-type { border-top: 0; padding-top: 0; }
+  ul { margin: 4px 0 10px; padding-left: 20px; }
+  iframe { display: none; }
+  .nowrap { white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Intel f16 bug in Axiya's ONNX Runtime Web build: before and after the fix</h1>
+  <p><strong>The bug:</strong> on an Intel gen-9 laptop GPU (Windows, Chrome 154, D3D12, September 2026), a GPU program that read one 16-bit number (f16) from memory got 0 for every odd-numbered element, so models gave wrong output.</p>
+  <p><strong>What this page does:</strong> it runs one tiny model on your GPU twice, once with the last build of Axiya's ONNX Runtime Web (WebGPU) from before the fix, and once with the first build after it. It then compares each output with values computed in advance on a CPU.</p>
+  <p><strong>Your result depends on your GPU, its driver and your browser.</strong> The bug was seen on one Intel gen-9 laptop in Chrome 154. On the same laptop in Chrome 158 (November 2026), a 16-bit read probe no longer fails, so there both builds may now be correct.</p>
+
+  <h2>This computer</h2>
+  <table id="env">
+    <tr><th>Browser</th><td id="env-browser">checking...</td></tr>
+    <tr><th>GPU vendor</th><td id="env-vendor">checking...</td></tr>
+    <tr><th>GPU architecture</th><td id="env-arch">checking...</td></tr>
+    <tr><th>GPU description</th><td id="env-desc">checking...</td></tr>
+    <tr><th>16-bit GPU math (<code>shader-f16</code>)</th><td id="env-f16">checking...</td></tr>
+  </table>
+
+  <div id="verdict" class="verdict">Running the two builds. This takes a few seconds...</div>
+
+  <div class="cols">
+    <section class="col" id="col-before">
+      <h3>Before (old build)</h3>
+      <p class="muted">Last build before the fix</p>
+      <div class="body">Waiting...</div>
+    </section>
+    <section class="col" id="col-after">
+      <h3>After (Axiya's fixed build)</h3>
+      <p class="muted">First build with the fix</p>
+      <div class="body">Waiting...</div>
+    </section>
+  </div>
+
+  <h2>The test</h2>
+  <table>
+    <tr><th>Model</th><th>What it does</th></tr>
+    <tr><td class="nowrap"><code>gather_f16.onnx</code></td><td>Picks 64 rows out of a 64 x 16 table of f16 values (a <code>Gather</code>, as in a model's embedding lookup). All 1024 values are different and none is 0. The first wrong step on the Intel laptop was this kind of <code>Gather</code>.</td></tr>
+    <tr><td class="nowrap"><code>cast_f16.onnx</code></td><td>Control. Turns 1023 f16 values into 32-bit values and adds 0. This kernel reads 4 values at a time, not one, so it is not expected to show the bug.</td></tr>
+  </table>
+  <p class="muted">The two models and the expected outputs (<code>expected.json</code>) come from <a href="make_model.py">make_model.py</a>. Outputs are compared bit for bit. "Odd" and "even" refer to the position of the value in the f16 input.</p>
+
+  <h2>The two builds</h2>
+  <table>
+    <tr><th></th><th>Before</th><th>After</th></tr>
+    <tr><th>Source</th>
+      <td>ONNX Runtime v1.30.0 + Axiya's patch at commit <a href="https://github.com/ParkingSoman/axiya-model-fixes/blob/3db61bb/browser-prototype/reference/onnxruntime-webgpu.patch"><code>3db61bb</code></a></td>
+      <td>ONNX Runtime v1.30.0 + Axiya's patch at commit <a href="https://github.com/ParkingSoman/axiya-model-fixes/blob/885da74/browser-prototype/reference/onnxruntime-webgpu.patch"><code>885da74</code></a> (the fix)</td></tr>
+    <tr><th>How the GPU program reads one f16 value</th>
+      <td>From an <code>array&lt;f16&gt;</code>: one 16-bit element per read</td>
+      <td>From an <code>array&lt;u32&gt;</code>: it reads the 32-bit word that holds two f16 values and takes the one it needs (<code>bitcast</code>)</td></tr>
+    <tr><th>Files</th><td><a href="https://github.com/ParkingSoman/axiya-model-fixes/tree/main/ort-before-after/before"><code>before/</code></a></td><td><a href="https://github.com/ParkingSoman/axiya-model-fixes/tree/main/ort-before-after/after"><code>after/</code></a></td></tr>
+    <tr><th>SHA-256 of the <code>.wasm</code></th><td><code>1c2fae8cfbcf966cf5dcc508620ec18e5caebc48d41b555b9e888edbf1cb64a5</code></td><td><code>e4e0a6d6ca2f0d1886cbaad947d62b69f2366f293088924a8f083ed318508979</code></td></tr>
+  </table>
+  <p class="muted">Each build runs in its own hidden frame (<a href="runner.html?build=before">runner.html</a>), so the two builds never share code, globals or a GPU device. The JavaScript loader <code>ort.webgpu.min.mjs</code> is the unchanged onnxruntime-web 1.30.0 file. Only the WebAssembly part and its glue file (<code>ort-wasm-simd-threaded.asyncify.*</code>) differ. ONNX Runtime is MIT-licensed. The licenses of all parts in these files are in <a href="https://github.com/ParkingSoman/axiya-model-fixes/tree/main/ort-before-after/licenses"><code>licenses/</code></a>.</p>
+</main>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+async function browserVersion() {
+  try {
+    const hints = await navigator.userAgentData.getHighEntropyValues(['fullVersionList', 'platformVersion']);
+    const brand = hints.fullVersionList.find((b) => b.brand === 'Google Chrome')
+      || hints.fullVersionList.find((b) => b.brand === 'Microsoft Edge')
+      || hints.fullVersionList.find((b) => b.brand === 'Chromium');
+    if (brand) return `${brand.brand} ${brand.version} on ${navigator.userAgentData.platform}`;
+  } catch {}
+  return navigator.userAgent;
+}
+
+async function gpuInfo() {
+  if (!navigator.gpu) return { error: 'This browser has no WebGPU.' };
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) return { error: 'WebGPU is present, but no GPU adapter is available.' };
+  const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
+  return { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description, f16: adapter.features.has('shader-f16') };
+}
+
+function runBuild(build) {
+  return new Promise((resolve) => {
+    const frame = document.createElement('iframe');
+    const timer = setTimeout(() => { done({ ok: false, error: 'No answer after 120 s (the GPU may have hung).' }); }, 120000);
+    function onMessage(e) {
+      if (e.source === frame.contentWindow && e.data && e.data.source === 'ort-runner') done(e.data);
+    }
+    function done(result) {
+      clearTimeout(timer);
+      removeEventListener('message', onMessage);
+      frame.remove(); // frees this build's GPU device before the next build starts
+      resolve(result);
+    }
+    addEventListener('message', onMessage);
+    frame.src = `runner.html?build=${build}`;
+    document.body.appendChild(frame);
+  });
+}
+
+function wrongCount(r) { return r.wrongOdd + r.wrongEven; }
+
+function testHtml(title, r) {
+  const good = wrongCount(r) === 0;
+  let html = `<div class="test"><div>${title}</div>
+    <div class="big ${good ? 'ok' : 'bad'}">${r.correct} of ${r.total} values correct</div>
+    <ul><li>Wrong odd elements: <strong class="${r.wrongOdd ? 'bad' : ''}">${r.wrongOdd}</strong> of ${r.odd}</li>
+    <li>Wrong even elements: <strong class="${r.wrongEven ? 'bad' : ''}">${r.wrongEven}</strong> of ${r.even}</li>`;
+  if (!good) html += `<li>Wrong values that came back as 0: ${r.wrongZero}</li>`;
+  html += '</ul>';
+  if (r.samples.length) {
+    html += '<table><tr><th>Position</th><th>Expected</th><th>Got</th></tr>' +
+      r.samples.map((s) => `<tr><td>${s.sourceOffset}</td><td>${esc(s.want)}</td><td class="bad">${esc(s.got)}</td></tr>`).join('') + '</table>';
+  }
+  return html + '</div>';
+}
+
+function gatherReadsAs(r) {
+  const decl = r.shaders.map((c) => c.match(/var<storage,\s*read>\s*data\s*:\s*(array<[^;]+>)/)).find(Boolean);
+  return decl ? decl[1] : null;
+}
+
+function showBuild(build, r) {
+  const body = document.querySelector(`#col-${build} .body`);
+  if (!r.ok) { body.innerHTML = `<p class="warn">Could not run: ${esc(r.error)}</p>`; return; }
+  const reads = gatherReadsAs(r.gather);
+  body.innerHTML = testHtml('<strong>Gather</strong> over an f16 table', r.gather) +
+    testHtml('<strong>Control:</strong> Cast f16 to 32-bit', r.cast) +
+    `<p class="muted" style="margin-top:10px">The <code>Gather</code> GPU program read the table as ${reads ? `<code>${esc(reads)}</code>` : 'an unknown type'}.</p>`;
+}
+
+function verdict(env, before, after) {
+  if (env.error) return ['warn', `${env.error} Neither build can run on the GPU here.`];
+  if (!before.ok || !after.ok) return ['warn', 'At least one build could not run on this computer. See the details below.'];
+  if (!env.f16) return ['warn', 'This GPU has no 16-bit math (shader-f16), so the f16 code path this page tests does not run here.'];
+  const b = wrongCount(before.gather) + wrongCount(before.cast);
+  const a = wrongCount(after.gather) + wrongCount(after.cast);
+  if (b > 0 && a === 0) return ['bad', 'On this computer the old build is broken and the fixed build is correct.'];
+  if (b === 0 && a === 0) return ['ok', 'On this computer both builds are correct. This GPU, driver and browser do not have the bug.'];
+  if (b > 0 && a > 0) return ['bad', 'On this computer both builds give wrong values.'];
+  return ['bad', 'On this computer the old build is correct, but the fixed build gives wrong values.'];
+}
+
+const [browser, env] = await Promise.all([browserVersion(), gpuInfo().catch((e) => ({ error: String(e.message || e) }))]);
+$('env-browser').textContent = browser;
+$('env-vendor').textContent = env.error ? env.error : (env.vendor || '(not reported)');
+$('env-arch').textContent = env.error ? '' : (env.architecture || '(not reported)');
+$('env-desc').textContent = env.error ? '' : [env.description, env.device].filter(Boolean).join(' / ') || '(not reported by this browser)';
+$('env-f16').textContent = env.error ? '' : (env.f16 ? 'yes' : 'no');
+
+const results = {};
+for (const build of ['before', 'after']) {
+  results[build] = env.error ? { ok: false, error: env.error } : await runBuild(build);
+  showBuild(build, results[build]);
+}
+const [cls, text] = verdict(env, results.before, results.after);
+$('verdict').className = `verdict ${cls}`;
+$('verdict').textContent = text;
+window.ortBeforeAfter = { browser, env, results, verdict: text };
+document.documentElement.dataset.done = '1';
+</script>
+</body>
+</html>
