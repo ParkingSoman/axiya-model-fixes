@@ -1,5 +1,11 @@
 # Axiya model fixes
 
+**In short:** Axiya runs AI models inside the web browser, on the user's own computer. That surfaced two bugs, which I found and fixed:
+1. Google's compact Gemma 4 models have one set of internal numbers about 64 times too small, which makes them read pages worse. Scaling those numbers up took one test page from 14 to 54 formulas read correctly, out of 96 (12 formulas, 8 tries each).
+2. Older Intel graphics chips read every second 16-bit number as 0, so the model wrote random words. Reading numbers in pairs fixed it: the laptop's output now matches a Mac's (similarity 0.999996, where 1 = identical).
+
+The rest of this page gives the details.
+
 Axiya (https://axiya.io) runs vision-language models locally in the browser on WebGPU, through a fork of ONNX Runtime Web.
 This repo holds the records of the model and GPU bugs I found and fixed to make that work.
 It was cut out of Axiya's private repo (code name BlinkFix), with the original commit history. Git dates are set by the author; the Hugging Face model cards below, created 2026-09-28, give an independent date for fix 1.
@@ -14,7 +20,7 @@ E2B's QAT checkpoint has the same defect, less strongly.
 
 The fix: scale that one tensor up (x64 for E4B, x53.65 for E2B). The norm cancels any scale, so only the eps effect goes away.
 
-Effect on one scanned math-paper page (llama.cpp, the released QAT Q4_0 file, 8 sampled draws per row):
+Effect on one scanned math-paper page (llama.cpp, the released QAT Q4_0 file, 8 sampled draws per row). An anchor is one formula or one stretch of text that must come out exactly right; the page has 12 formula anchors and 38 text anchors, each read 8 times:
 
 | Model file | Formula anchors | Text anchors |
 |---|---|---|
