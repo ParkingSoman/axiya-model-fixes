@@ -56,7 +56,7 @@
   <h1>Intel f16 bug in Axiya's ONNX Runtime Web build: before and after the fix</h1>
   <p><strong>The bug:</strong> on an Intel gen-9 laptop GPU (Windows, Chrome 154, D3D12, September 2026), a GPU program that read one 16-bit number (f16) from memory got 0 for every odd-numbered element, so models gave wrong output.</p>
   <p><strong>What this page does:</strong> it runs one tiny model on your GPU twice, once with the last build of Axiya's ONNX Runtime Web (WebGPU) from before the fix, and once with the first build after it. It then compares each output with values computed in advance on a CPU.</p>
-  <p><strong>Where the fault was:</strong> in the laptop's older Windows and Intel graphics driver. In October 2026 the same laptop moved to Windows 11 build 26300 and Intel driver 31.0.101.2140. On that setup, the same Chrome 154 runs the old build correctly. So on most computers today both builds below are correct; the fixed build protects computers that still run the older driver.</p>
+  <p><strong>What the bug depended on:</strong> the laptop's older Windows and Intel graphics driver, not the Chrome version. In October 2026 the same laptop moved to Windows 11 build 26300 and Intel driver 31.0.101.2140. On that setup, the same Chrome 154 runs the old build correctly. So on most computers today both builds below are correct; the fixed build protects computers that still run the older driver.</p>
   <p>Below: what the model actually wrote on the laptop in September (recorded), a simulation of the fault, and a live run of both builds on your GPU.</p>
 
   <h2>Recorded on the laptop, September 28, 2026</h2>
